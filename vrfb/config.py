@@ -135,3 +135,7 @@ class VRFBConfig:
 
         # Flow protection threshold
         self.flow_critical = 8.0 * self.LPM_to_m3s  # below this is dangerous
+        # 12. CONVERTER DYNAMICS
+# ============================================================
+
+        self.tau_converter = 0.2   # seconds (current control response time)

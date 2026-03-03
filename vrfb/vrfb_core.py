@@ -10,7 +10,7 @@ class VRFB:
         self.cfg = config
         self.state = self._initialize_state()
         self.time = 0.0
-        self.last_current = 0.0
+        
 
     # ============================================================
     # INITIAL STATE
@@ -34,7 +34,8 @@ class VRFB:
             self.cfg.initial_temperature,            # T_tank
             self.cfg.initial_flow,                   # Flow
             self.cfg.R_membrane_initial,             # R_membrane
-            self.cfg.initial_Q_nominal               # Q_nominal
+            self.cfg.initial_Q_nominal,
+            0.0               # Q_nominal
         ], dtype=float)
 
     # ============================================================
@@ -48,17 +49,17 @@ class VRFB:
             C_V2_s, C_V3_s, C_VO2_s, C_VO2plus_s,
             C_V2_t, C_V3_t, C_VO2_t, C_VO2plus_t,
             T_s, T_t,
-            Q, R_m, Q_nom
+            Q, R_m, Q_nom,I_actual
         ) = x
 
         # ---------------------------
         # Stack species dynamics
         # ---------------------------
-        dC_V2_s = (Q/cfg.V_stack)*(C_V2_t - C_V2_s) - I/(cfg.n*cfg.F*cfg.V_stack)
-        dC_V3_s = (Q/cfg.V_stack)*(C_V3_t - C_V3_s) + I/(cfg.n*cfg.F*cfg.V_stack)
+        dC_V2_s = (Q/cfg.V_stack)*(C_V2_t - C_V2_s) - I_actual/(cfg.n*cfg.F*cfg.V_stack)
+        dC_V3_s = (Q/cfg.V_stack)*(C_V3_t - C_V3_s) + I_actual/(cfg.n*cfg.F*cfg.V_stack)
 
-        dC_VO2_s = (Q/cfg.V_stack)*(C_VO2_t - C_VO2_s) + I/(cfg.n*cfg.F*cfg.V_stack)
-        dC_VO2plus_s = (Q/cfg.V_stack)*(C_VO2plus_t - C_VO2plus_s) - I/(cfg.n*cfg.F*cfg.V_stack)
+        dC_VO2_s = (Q/cfg.V_stack)*(C_VO2_t - C_VO2_s) + I_actual/(cfg.n*cfg.F*cfg.V_stack)
+        dC_VO2plus_s = (Q/cfg.V_stack)*(C_VO2plus_t - C_VO2plus_s) - I_actual/(cfg.n*cfg.F*cfg.V_stack)
 
         # ---------------------------
         # Tank dynamics
@@ -94,7 +95,7 @@ class VRFB:
         # Thermal model
         # ---------------------------
         R_stack = (R_m + cfg.R_contact) * cfg.N_cells
-        heat_generation = I**2 * R_stack
+        heat_generation = I_actual**2 * R_stack
 
         dT_s = (heat_generation - cfg.h_stack_tank*(T_s - T_t)) / cfg.C_th_stack
         dT_t = (cfg.h_stack_tank*(T_s - T_t)
@@ -108,15 +109,18 @@ class VRFB:
         # ---------------------------
         # Aging
         # ---------------------------
-        dR_m = cfg.k_membrane_aging * abs(I)
-        dQ_nom = -cfg.k_capacity_fade * abs(I)
+        dR_m = cfg.k_membrane_aging * abs(I_actual)
+        dQ_nom = -cfg.k_capacity_fade * abs(I_actual)
+        dI_actual = (I - I_actual) / cfg.tau_converter
 
         return [
             dC_V2_s, dC_V3_s, dC_VO2_s, dC_VO2plus_s,
             dC_V2_t, dC_V3_t, dC_VO2_t, dC_VO2plus_t,
             dT_s, dT_t,
-            dQ, dR_m, dQ_nom
+            dQ, dR_m, dQ_nom,
+            dI_actual
         ]
+    
 
     # ============================================================
     # STEP SIMULATION
@@ -129,7 +133,6 @@ class VRFB:
         I = np.clip(I, cfg.I_min, cfg.I_max)
         Q_cmd = np.clip(Q_cmd, cfg.flow_min, cfg.flow_max)
 
-        self.last_current = I
 
         # 2️⃣ Solve ODE
         sol = solve_ivp(
@@ -138,24 +141,10 @@ class VRFB:
             self.state,
             method="BDF"
         )
-
         self.state = sol.y[:, -1]
 
         # 3️⃣ Numerical stability
         self.state[:8] = np.clip(self.state[:8], 1e-12, None)
-        self.state[-1] = max(self.state[-1], 0.0)
-
-        # 4️⃣ SOC safety window
-        C_V2_t = self.state[4]
-        C_V3_t = self.state[5]
-        soc = C_V2_t / (C_V2_t + C_V3_t + 1e-12)
-
-        if soc >= cfg.soc_max and I < 0:
-            self.last_current = 0.0
-
-        if soc <= cfg.soc_min and I > 0:
-            self.last_current = 0.0
-
         self.time += dt
 
     # ============================================================
@@ -169,7 +158,7 @@ class VRFB:
             C_V2_s, C_V3_s, C_VO2_s, C_VO2plus_s,
             C_V2_t, C_V3_t, _, _,
             T_s, T_t,
-            Q, R_m, Q_nom
+            Q, R_m, Q_nom,I_actual
         ) = self.state
 
         # True SOC
@@ -187,12 +176,12 @@ class VRFB:
 
         # Ohmic loss
         R_stack = (R_m + cfg.R_contact) * cfg.N_cells
-        V_ohmic = R_stack * self.last_current
+        V_ohmic = R_stack * I_actual
 
         # ------------------------------------------------------------
         # MASS TRANSPORT (CONCENTRATION) OVERPOTENTIAL - DO NOT REMOVE
         # ------------------------------------------------------------
-        if self.last_current >= 0: # Discharging
+        if I_actual >= 0: # Discharging
             C_active = min(C_V2_s, C_VO2plus_s)
         else:                      # Charging
             C_active = min(C_V3_s, C_VO2_s)
@@ -201,7 +190,7 @@ class VRFB:
         I_limit = cfg.n * cfg.F * max(Q, 1e-7) * C_active
         
         # Ratio of actual current to limiting current (clamped for math safety)
-        ratio = abs(self.last_current) / (I_limit + 1e-9)
+        ratio = abs(I_actual) / (I_limit + 1e-9)
         ratio = np.clip(ratio, 0.0, 0.999)
         
         # V_conc calculation (This will always be a negative number)
@@ -209,7 +198,7 @@ class VRFB:
 
         # Final Cell Voltage
         # If discharging (I > 0), subtract V_conc. If charging (I < 0), subtract V_conc to push voltage higher.
-        if self.last_current >= 0:
+        if I_actual >= 0:
             V_cell = E + V_conc  # V_conc is negative, so adding it lowers voltage
         else:
             V_cell = E - V_conc  # Charging requires pushing against concentration limits
@@ -231,5 +220,5 @@ class VRFB:
             "capacity_nominal": Q_nom,
             "pump_power": pump_power,
             "i_limit": I_limit, # Helpful to track in your dashboard
-            "current": self.last_current
+            "current": I_actual
         }

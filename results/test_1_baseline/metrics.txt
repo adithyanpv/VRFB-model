@@ -1,5 +1,5 @@
 === SOC Estimation Performance ===
-RMSE: 0.000634
-MAE: 0.000572
-Max Absolute Error: 0.000827
-Final Drift Error: 0.000738
+RMSE: 0.000635
+MAE: 0.000574
+Max Absolute Error: 0.000830
+Final Drift Error: 0.000739
