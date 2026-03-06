@@ -61,8 +61,10 @@ class BMSController:
         # --------------------------------------------------------
         if I_limit is not None and I_limit > 0:
             I_max_allowed = cfg.limiting_current_margin * I_limit
-            if abs(I_safe) > I_max_allowed:
-                I_safe = np.sign(I_safe) * I_max_allowed
+            ratio = abs(I_safe) / I_max_allowed
+            if ratio > 1:
+                I_safe /= ratio
+            
 
         # --------------------------------------------------------
         # 6️⃣ FLOW-CRITICAL DERATING

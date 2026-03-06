@@ -34,7 +34,7 @@ temperature = []
 flow = []
 i_limit_log = []
 pump_power = []
-
+transport_ratio = []
 # ------------------------------------------------------------
 # Simulation Loop
 # ------------------------------------------------------------
@@ -64,6 +64,7 @@ for step in range(steps):
     # --------------------------------------------------------
     # BMS Protection
     # --------------------------------------------------------
+    
     prev_out = battery.get_outputs()
     I_safe = bms.apply_protection(I_cmd, prev_out)
 
@@ -83,6 +84,7 @@ for step in range(steps):
         dt=dt,
         Q_nominal=out["capacity_nominal"]
     )
+    print(out["i_limit"], out["current"])
 
     # --------------------------------------------------------
     # Logging
@@ -96,6 +98,7 @@ for step in range(steps):
     flow.append(out["flow_rate"])
     i_limit_log.append(out["i_limit"])
     pump_power.append(out["pump_power"])
+    transport_ratio.append(out["transport_ratio"])
 
 
 # ------------------------------------------------------------
@@ -119,7 +122,7 @@ folder = "results/test_6_flow_sweep_dynamic"
 
 save_plots(folder,
            time_log, true_soc, est_soc,
-           voltage, current, temperature, flow)
+           voltage, current, temperature, flow,transport_ratio)
 
 save_metrics(folder, rmse, mae, max_e, final_e)
 plt.figure()

@@ -16,7 +16,7 @@ def compute_metrics(true_soc, est_soc):
     return rmse, mae, max_error, final_error
 
 
-def save_plots(folder, time, true_soc, est_soc, voltage, current, temperature, flow):
+def save_plots(folder, time, true_soc, est_soc, voltage, current, temperature, flow,transport_ratio=None):
 
     os.makedirs(folder, exist_ok=True)
 
@@ -57,6 +57,25 @@ def save_plots(folder, time, true_soc, est_soc, voltage, current, temperature, f
     plt.tight_layout()
     plt.savefig(f"{folder}/results.png")
     plt.close()
+    if transport_ratio is not None:
+        plt.figure()
+
+        plt.plot(time, transport_ratio)
+        plt.title("Transport Utilization Ratio (|I| / I_limit)")
+        plt.xlabel("Time (s)")
+        plt.ylabel("Transport Ratio")
+        plt.grid()
+
+        plt.axhline(0.3, linestyle="--")
+        plt.axhline(0.7, linestyle="--")
+        plt.axhline(0.9, linestyle="--")
+
+        plt.savefig(f"{folder}/transport_ratio.png")
+        plt.close()
+        
+
+    
+
 def save_metrics(folder, rmse, mae, max_error, final_error):
 
     os.makedirs(folder, exist_ok=True)

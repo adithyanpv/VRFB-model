@@ -186,8 +186,24 @@ class VRFB:
         else:                      # Charging
             C_active = min(C_V3_s, C_VO2_s)
             
-        # Limiting Current based on Flow Rate (Q)
-        I_limit = cfg.n * cfg.F * max(Q, 1e-7) * C_active
+        # ------------------------------------------------------------
+    # MASS TRANSFER LIMITING CURRENT (Realistic VRFB Model)
+      # ------------------------------------------------------------
+
+    # Reference mass transfer coefficient
+        k_ref = cfg.k_mass_transfer_coeff
+
+     # Reference flow
+        Q_ref = cfg.initial_flow
+
+       # Flow dependent mass transfer coefficient
+        k_m = k_ref * (Q / Q_ref) ** 0.4
+
+       # Electrode area
+        A = cfg.electrode_area
+
+       # Limiting current
+        I_limit = cfg.n * cfg.F * k_m * A * C_active
         
         # Ratio of actual current to limiting current (clamped for math safety)
         ratio = abs(I_actual) / (I_limit + 1e-9)
@@ -206,6 +222,7 @@ class VRFB:
         # Final Stack Voltage (Nernst/Mass Transport are per cell, Ohmic is already stack-level)
         voltage = (cfg.N_cells * V_cell) - V_ohmic
         # ------------------------------------------------------------
+        transport_ratio = abs(I_actual) / (I_limit + 1e-9)
 
         pump_power = cfg.pump_power_coeff * Q**3
 
@@ -219,6 +236,7 @@ class VRFB:
             "membrane_resistance": R_m,
             "capacity_nominal": Q_nom,
             "pump_power": pump_power,
+            "transport_ratio": transport_ratio,
             "i_limit": I_limit, # Helpful to track in your dashboard
             "current": I_actual
         }

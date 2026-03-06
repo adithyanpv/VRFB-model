@@ -131,7 +131,7 @@ class VRFBConfig:
         self.T_derate = 320.0       # K start derating
 
         # Current derating margin
-        self.limiting_current_margin = 0.9
+        self.limiting_current_margin = 0.7
 
         # Flow protection threshold
         self.flow_critical = 8.0 * self.LPM_to_m3s  # below this is dangerous
