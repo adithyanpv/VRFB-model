@@ -45,7 +45,7 @@ for step in range(steps):
     # -------------------------------
     # Dynamic Step Load (same as Test 5)
     # -------------------------------
-    I_cmd = 250
+    I_cmd = 120
 
     # -------------------------------
     # Flow Sweep (key part of test)

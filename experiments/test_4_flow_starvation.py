@@ -40,7 +40,7 @@ for step in range(steps):
     t = step * dt
 
     # Moderate discharge
-    I_cmd = 150
+    I_cmd = 80
 
     # Normal temperature
     T = 298.15
