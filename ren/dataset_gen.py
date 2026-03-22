@@ -1,7 +1,25 @@
 # ren/dataset_gen.py
 """
-VRFB Dataset Generator — v2 (Stratified SOC Coverage)
-=======================================================
+VRFB Dataset Generator — v3 (Realistic CC Degradation)
+========================================================
+FIXES FROM v2 — making CC drift visible so REN has something to beat:
+
+  A. WRONG INITIAL SOC  — CC starts with ±10% random error from true SOC.
+     Real batteries never know their exact SOC at power-on. The BMS must
+     guess from the last known value, which may be hours old or corrupted
+     by self-discharge. This causes CC to carry a permanent offset that
+     grows over the episode as integration errors compound on top.
+
+  B. CURRENT SENSOR BIAS  — CC integrates a biased current measurement.
+     Every real shunt/Hall sensor has a small DC offset (±0.5–2A typical).
+     At 18,000 steps, a 1A bias integrates to 5 Ah of error, which on a
+     2144 Ah system = 0.23% per episode — small per episode but the REN
+     must learn to detect and correct it from the voltage signal.
+
+  Both errors are realistic, physically motivated, and common causes of
+  CC failure in deployed systems. Together they push CC RMSE to ~3–8%,
+  creating a clear performance gap for the REN to close.
+
 FIXES FROM v1:
   1. Stratified initial SOC — episodes are assigned to SOC bands so every
      0.1-wide bin from 0.05→0.95 is uniformly covered.
@@ -70,7 +88,7 @@ SOC_BANDS = [
 # Assign each episode to a band (round-robin for uniform coverage)
 episode_bands = [SOC_BANDS[ep % len(SOC_BANDS)] for ep in range(N_EPISODES)]
 
-print("VRFB Dataset Generator  v2  (Stratified SOC Coverage)")
+print("VRFB Dataset Generator  v3  (Realistic CC Degradation)")
 print(f"  Episodes      : {N_EPISODES}")
 print(f"  Steps/episode : {EPISODE_STEPS:,}  ({EPISODE_STEPS/3600:.1f} hours each)")
 print(f"  Total rows    : ~{N_EPISODES * EPISODE_STEPS:,}")
@@ -224,13 +242,26 @@ for ep in tqdm(range(N_EPISODES), desc="Generating episodes"):
     flow_type    = rng.choice(FLOW_PROFILES)
     T_base       = rng.uniform(293.0, 318.0)
 
+    # ── Option A: wrong initial SOC for CC (±10% of true SOC) ────────────
+    # Simulates power-on uncertainty — BMS guesses SOC from stale data.
+    # Bias drawn once per episode and held constant (it's an initial error,
+    # not noise — it integrates forward permanently).
+    cc_init_offset = rng.uniform(-0.10, 0.10)
+    soc_cc_init    = float(np.clip(init_soc + cc_init_offset, 0.06, 0.94))
+
+    # ── Option B: current sensor bias (±1.5A DC offset) ──────────────────
+    # Simulates shunt/Hall sensor calibration error.
+    # Drawn once per episode — it's a property of the sensor, not random
+    # noise each step. At 18,000s and 1A bias: 5 Ah error = 0.23% SOC/episode.
+    current_bias = rng.uniform(-1.5, 1.5)
+
     cfg             = VRFBConfig()
     cfg.initial_soc = init_soc
     battery = VRFB(cfg)
     bms     = BMSController(cfg)
     sensor  = SensorModel(cfg)
     cc      = CoulombCounter(cfg)
-    cc.initialize(init_soc)
+    cc.initialize(soc_cc_init)   # Option A: start CC from wrong SOC
 
     dt = cfg.dt_default
 
@@ -244,7 +275,7 @@ for ep in tqdm(range(N_EPISODES), desc="Generating episodes"):
     Q_first = float(Q_profile[0])
     for _ in range(200):
         battery.step(0.0, Q_first, T_profile[0], dt)
-    cc.initialize(init_soc)  # reset CC after warmup
+    cc.initialize(soc_cc_init)   # reset to biased init after warmup (Option A)
 
     # ── Initialise prev values from actual first output (no dVdt spike) ───────
     first_out = battery.get_outputs()
@@ -268,7 +299,7 @@ for ep in tqdm(range(N_EPISODES), desc="Generating episodes"):
         measured = sensor.measure(out)
 
         soc_cc = cc.update(
-            measured_current = measured["current"],
+            measured_current = measured["current"] + current_bias,  # Option B: biased sensor
             dt               = dt,
             Q_nominal        = out["capacity_nominal"]
         )
@@ -320,7 +351,7 @@ df_test.to_csv("datasets/vrfb_test.csv",   index=False)
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 print(f"\n{'='*60}")
-print(f"Dataset generation complete  (v2 — stratified)")
+print(f"Dataset generation complete  (v3 — realistic CC degradation)")
 print(f"{'='*60}")
 print(f"  Total rows    : {len(df):,}")
 print(f"  Train rows    : {len(df_train):,}  ({n_train} episodes)")
@@ -330,6 +361,21 @@ print(f"  Voltage range  : {df['voltage'].min():.2f} – {df['voltage'].max():.2
 print(f"  Current range  : {df['current'].min():.2f} – {df['current'].max():.2f} A")
 print(f"  Temp range     : {df['temperature_stack'].min():.2f} – {df['temperature_stack'].max():.2f} K")
 print(f"  Flow range     : {df['flow_rate'].min()*60000:.1f} – {df['flow_rate'].max()*60000:.1f} LPM")
+
+# CC degradation statistics — this shows the REN has something meaningful to beat
+cc_errors = np.abs(df["SOC_true"].values - df["soc_cc"].values)
+cc_rmse   = np.sqrt(np.mean(cc_errors**2))
+cc_mae    = cc_errors.mean()
+cc_max    = cc_errors.max()
+print(f"\n  CC baseline errors (what REN must beat):")
+print(f"    RMSE      : {cc_rmse:.4f}  ({cc_rmse*100:.2f}% SOC)")
+print(f"    MAE       : {cc_mae:.4f}  ({cc_mae*100:.2f}% SOC)")
+print(f"    Max error : {cc_max:.4f}  ({cc_max*100:.2f}% SOC)")
+if cc_rmse < 0.02:
+    print(f"  [WARN] CC RMSE {cc_rmse:.4f} is very low — REN may struggle to beat it")
+    print(f"         Consider increasing cc_init_offset range beyond ±0.10")
+elif cc_rmse > 0.03:
+    print(f"  [GOOD] CC RMSE {cc_rmse:.4f} gives REN a clear target to beat")
 
 print(f"\n  SOC coverage (target: all bins roughly equal):")
 bins = np.linspace(0, 1, 11)

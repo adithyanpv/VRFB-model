@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VRFB BMS — Live Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;400;600;700&family=Barlow:wght@300;400&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg:        #080e1a;
+  --bg2:       #0d1525;
+  --bg3:       #111d30;
+  --border:    #1e3050;
+  --border2:   #2a4060;
+  --text:      #c8d8f0;
+  --text-dim:  #5a7a9a;
+  --text-mute: #2a4060;
+  --cyan:      #00e5ff;
+  --green:     #00ff9d;
+  --orange:    #ff8c42;
+  --red:       #ff3d5a;
+  --yellow:    #ffd740;
+  --purple:    #b388ff;
+  --mono:      'Share Tech Mono', monospace;
+  --sans:      'Barlow Condensed', sans-serif;
+  --body:      'Barlow', sans-serif;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--body);
+  font-size: 13px;
+  line-height: 1.4;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* ── HEADER ── */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 24px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 100;
+}
+.header-title {
+  font-family: var(--sans);
+  font-weight: 700;
+  font-size: 18px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: var(--cyan);
+}
+.header-title span { color: var(--text-dim); font-weight: 300; }
+.header-status {
+  display: flex; gap: 20px; align-items: center;
+}
+.conn-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--red);
+  box-shadow: 0 0 8px var(--red);
+  transition: all .3s;
+}
+.conn-dot.live { background: var(--green); box-shadow: 0 0 10px var(--green); }
+.conn-label { font-family: var(--mono); font-size: 11px; color: var(--text-dim); letter-spacing: 1px; }
+.header-time { font-family: var(--mono); font-size: 12px; color: var(--text-dim); }
+
+/* ── LAYOUT ── */
+.layout {
+  display: grid;
+  grid-template-columns: 260px 1fr 240px;
+  grid-template-rows: auto 1fr auto;
+  gap: 1px;
+  background: var(--border);
+  min-height: calc(100vh - 49px);
+}
+.panel {
+  background: var(--bg2);
+  padding: 16px;
+  min-height: 0;
+}
+.panel-label {
+  font-family: var(--sans);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: var(--text-mute);
+  margin-bottom: 12px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ── SOC GAUGES (left column) ── */
+.left-col { grid-row: 1 / 4; display: flex; flex-direction: column; gap: 1px; }
+
+.soc-gauge-wrap { text-align: center; padding: 20px 16px 12px; }
+.soc-label { font-family: var(--sans); font-size: 10px; letter-spacing: 3px; text-transform: uppercase; }
+.soc-label.true  { color: var(--cyan); }
+.soc-label.ren   { color: var(--green); }
+.soc-label.cc    { color: var(--orange); }
+
+.arc-container { position: relative; width: 180px; height: 100px; margin: 8px auto 4px; }
+.arc-bg, .arc-fill {
+  position: absolute; top: 0; left: 0;
+  width: 180px; height: 180px;
+  border-radius: 50%;
+  clip-path: polygon(0 0, 100% 0, 100% 55%, 0 55%);
+}
+.arc-bg   { border: 8px solid var(--bg3); }
+.arc-fill { border: 8px solid transparent; transition: all .4s cubic-bezier(.4,0,.2,1); }
+.arc-fill.true  { border-top-color: var(--cyan); border-left-color: var(--cyan); }
+.arc-fill.ren   { border-top-color: var(--green); border-left-color: var(--green); }
+.arc-fill.cc    { border-top-color: var(--orange); border-left-color: var(--orange); }
+
+.soc-value {
+  font-family: var(--mono);
+  font-size: 32px;
+  letter-spacing: -1px;
+  line-height: 1;
+  margin-top: 4px;
+}
+.soc-value.true  { color: var(--cyan); }
+.soc-value.ren   { color: var(--green); }
+.soc-value.cc    { color: var(--orange); }
+
+.soc-error {
+  font-family: var(--mono);
+  font-size: 11px;
+  margin-top: 4px;
+}
+.err-good { color: var(--green); }
+.err-warn { color: var(--yellow); }
+.err-bad  { color: var(--red); }
+
+.divider { height: 1px; background: var(--border); margin: 0 16px; }
+
+/* ── MAIN CHART AREA ── */
+.main-col { grid-column: 2; grid-row: 1 / 3; display: flex; flex-direction: column; gap: 1px; }
+.chart-wrap { flex: 1; min-height: 0; padding: 16px 20px; background: var(--bg2); }
+.chart-canvas-wrap { position: relative; height: calc(100% - 32px); min-height: 260px; }
+
+/* ── ERROR CHART ── */
+.err-chart-wrap { height: 180px; padding: 16px 20px; background: var(--bg2); }
+.err-canvas-wrap { position: relative; height: calc(100% - 32px); }
+
+/* ── RIGHT GAUGES ── */
+.right-col { grid-row: 1 / 4; display: flex; flex-direction: column; gap: 1px; }
+
+.metric-block { padding: 14px 16px; }
+.metric-name {
+  font-family: var(--sans);
+  font-size: 10px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 2px;
+}
+.metric-val {
+  font-family: var(--mono);
+  font-size: 26px;
+  letter-spacing: -1px;
+  line-height: 1;
+}
+.metric-unit { font-size: 12px; color: var(--text-dim); margin-left: 3px; }
+.metric-bar { height: 3px; background: var(--bg3); border-radius: 2px; margin-top: 6px; overflow: hidden; }
+.metric-bar-fill { height: 100%; border-radius: 2px; transition: width .4s ease; }
+
+/* ── BMS LAYER STATUS ── */
+.bms-layers { padding: 12px 16px; background: var(--bg2); }
+.bms-layer {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 5px 8px; margin-bottom: 3px;
+  border-radius: 3px;
+  background: var(--bg3);
+  border-left: 3px solid var(--border2);
+  transition: all .2s;
+}
+.bms-layer.active {
+  background: rgba(255,61,90,0.12);
+  border-left-color: var(--red);
+}
+.bms-layer.active .layer-name { color: var(--red); }
+.bms-layer.derate {
+  background: rgba(255,215,64,0.1);
+  border-left-color: var(--yellow);
+}
+.bms-layer.derate .layer-name { color: var(--yellow); }
+.layer-num {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-mute);
+  width: 16px;
+}
+.layer-name {
+  font-family: var(--sans);
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+  flex: 1;
+  padding: 0 8px;
+  transition: color .2s;
+}
+.layer-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--text-mute);
+  transition: all .2s;
+}
+.bms-layer.active  .layer-dot { background: var(--red);    box-shadow: 0 0 6px var(--red); }
+.bms-layer.derate  .layer-dot { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
+
+/* ── CONTROLS ── */
+.controls-row { grid-column: 2; display: flex; gap: 1px; background: var(--border); }
+.control-group {
+  flex: 1; padding: 14px 16px; background: var(--bg2);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.ctrl-label {
+  font-family: var(--sans);
+  font-size: 10px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.ctrl-row { display: flex; align-items: center; gap: 10px; }
+.ctrl-slider {
+  flex: 1; -webkit-appearance: none;
+  height: 3px; border-radius: 2px;
+  background: var(--bg3); outline: none; cursor: pointer;
+}
+.ctrl-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--cyan);
+  box-shadow: 0 0 8px var(--cyan);
+  cursor: pointer;
+}
+.ctrl-val {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--cyan);
+  min-width: 50px;
+  text-align: right;
+}
+.btn {
+  padding: 7px 14px;
+  border: 1px solid var(--border2);
+  background: transparent;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 11px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  cursor: pointer;
+  border-radius: 2px;
+  transition: all .2s;
+}
+.btn:hover { background: var(--border2); color: var(--cyan); border-color: var(--cyan); }
+.btn.charge  { border-color: var(--purple); color: var(--purple); }
+.btn.charge:hover  { background: rgba(179,136,255,.15); }
+.btn.dis { border-color: var(--green); color: var(--green); }
+.btn.dis:hover  { background: rgba(0,255,157,.1); }
+.btn.stop { border-color: var(--red); color: var(--red); }
+.btn.stop:hover { background: rgba(255,61,90,.15); }
+.btn.reset-btn { border-color: var(--yellow); color: var(--yellow); }
+.btn.reset-btn:hover { background: rgba(255,215,64,.1); }
+
+/* ── STATS ROW ── */
+.stats-row {
+  grid-column: 1 / 4;
+  display: flex; gap: 1px; background: var(--border);
+}
+.stat-cell {
+  flex: 1; padding: 10px 16px; background: var(--bg2);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.stat-name {
+  font-family: var(--sans);
+  font-size: 9px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--text-mute);
+}
+.stat-val { font-family: var(--mono); font-size: 15px; }
+
+/* ── SCAN LINE EFFECT ── */
+body::after {
+  content: '';
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: repeating-linear-gradient(
+    0deg, transparent, transparent 2px,
+    rgba(0,0,0,.03) 2px, rgba(0,0,0,.03) 4px
+  );
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* ── SCROLLBAR ── */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+/* ── FLASH ANIMATION ── */
+@keyframes flash {
+  0%,100% { opacity: 1; }
+  50%      { opacity: .4; }
+}
+.flashing { animation: flash .6s ease infinite; }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="header">
+  <div class="header-title">VRFB<span> / </span>BMS<span> — </span>LIVE DASHBOARD</div>
+  <div class="header-status">
+    <div class="conn-dot" id="connDot"></div>
+    <div class="conn-label" id="connLabel">CONNECTING</div>
+    <div class="header-time" id="headerTime">T+0s</div>
+  </div>
+</div>
+
+<div class="layout">
+
+  <!-- ═══ LEFT COLUMN: SOC GAUGES ═══ -->
+  <div class="left-col">
+    <div class="panel soc-gauge-wrap" style="padding-top:24px;">
+      <div class="panel-label">STATE OF CHARGE</div>
+
+      <div style="margin-bottom:16px;">
+        <div class="soc-label true">GROUND TRUTH</div>
+        <div class="soc-value true" id="socTrue">—</div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--text-dim);margin-top:2px;">Physics model</div>
+        <div class="metric-bar" style="margin-top:8px;">
+          <div class="metric-bar-fill" id="barTrue" style="background:var(--cyan);width:50%"></div>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+      <div style="margin:16px 0;">
+        <div class="soc-label ren">REN ESTIMATE</div>
+        <div class="soc-value ren" id="socRen">—</div>
+        <div class="soc-error" id="errRen">ERR: —</div>
+        <div class="metric-bar" style="margin-top:6px;">
+          <div class="metric-bar-fill" id="barRen" style="background:var(--green);width:50%"></div>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+      <div style="margin-top:16px;">
+        <div class="soc-label cc">COULOMB COUNTER</div>
+        <div class="soc-value cc" id="socCC">—</div>
+        <div class="soc-error" id="errCC">ERR: —</div>
+        <div class="metric-bar" style="margin-top:6px;">
+          <div class="metric-bar-fill" id="barCC" style="background:var(--orange);width:50%"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- BMS LAYERS -->
+    <div class="panel bms-layers">
+      <div class="panel-label">BMS PROTECTION LAYERS</div>
+      <div class="bms-layer" id="l1">
+        <div class="layer-num">L1</div>
+        <div class="layer-name">VOLTAGE CUTOFF</div>
+        <div class="layer-dot"></div>
+      </div>
+      <div class="bms-layer" id="l2">
+        <div class="layer-num">L2</div>
+        <div class="layer-name">SOC WINDOW</div>
+        <div class="layer-dot"></div>
+      </div>
+      <div class="bms-layer" id="l3">
+        <div class="layer-num">L3</div>
+        <div class="layer-name">THERMAL SHUTDOWN</div>
+        <div class="layer-dot"></div>
+      </div>
+      <div class="bms-layer" id="l4">
+        <div class="layer-num">L4</div>
+        <div class="layer-name">THERMAL DERATE</div>
+        <div class="layer-dot"></div>
+      </div>
+      <div class="bms-layer" id="l5">
+        <div class="layer-num">L5</div>
+        <div class="layer-name">I_LIMIT DERATE</div>
+        <div class="layer-dot"></div>
+      </div>
+      <div class="bms-layer" id="l6">
+        <div class="layer-num">L6</div>
+        <div class="layer-name">FLOW DERATE</div>
+        <div class="layer-dot"></div>
+      </div>
+      <div style="margin-top:10px;padding:8px;background:var(--bg3);border-radius:3px;">
+        <div class="stat-name">DERATE AMOUNT</div>
+        <div style="font-family:var(--mono);font-size:18px;color:var(--yellow);" id="derateVal">0.0%</div>
+        <div class="stat-name" style="margin-top:4px;">I_CMD → I_SAFE</div>
+        <div style="font-family:var(--mono);font-size:12px;color:var(--text-dim);" id="currFlow">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ MAIN CHART ═══ -->
+  <div class="main-col">
+    <div class="chart-wrap">
+      <div class="panel-label">SOC TIME SERIES — GROUND TRUTH vs CC vs REN</div>
+      <div class="chart-canvas-wrap">
+        <canvas id="socChart"></canvas>
+      </div>
+    </div>
+    <div class="err-chart-wrap">
+      <div class="panel-label">ABSOLUTE ERROR — |REN − TRUE| vs |CC − TRUE|</div>
+      <div class="err-canvas-wrap">
+        <canvas id="errChart"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ RIGHT COLUMN: METRICS ═══ -->
+  <div class="right-col">
+    <div class="panel">
+      <div class="panel-label">ELECTRICAL</div>
+      <div class="metric-block">
+        <div class="metric-name">STACK VOLTAGE</div>
+        <div class="metric-val" id="mVoltage" style="color:var(--cyan);">—<span class="metric-unit">V</span></div>
+        <div class="metric-bar"><div class="metric-bar-fill" id="bVoltage" style="background:var(--cyan);width:50%"></div></div>
+      </div>
+      <div class="metric-block">
+        <div class="metric-name">CURRENT (MEASURED)</div>
+        <div class="metric-val" id="mCurrent" style="color:var(--green);">—<span class="metric-unit">A</span></div>
+        <div class="metric-bar"><div class="metric-bar-fill" id="bCurrent" style="background:var(--green);width:50%"></div></div>
+      </div>
+      <div class="metric-block">
+        <div class="metric-name">POWER</div>
+        <div class="metric-val" id="mPower" style="color:var(--purple);">—<span class="metric-unit">kW</span></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-label">THERMAL</div>
+      <div class="metric-block">
+        <div class="metric-name">STACK TEMP</div>
+        <div class="metric-val" id="mTempStack" style="color:var(--orange);">—<span class="metric-unit">K</span></div>
+        <div class="metric-bar"><div class="metric-bar-fill" id="bTemp" style="background:var(--orange);width:30%"></div></div>
+      </div>
+      <div class="metric-block">
+        <div class="metric-name">TANK TEMP</div>
+        <div class="metric-val" id="mTempTank" style="color:var(--orange);font-size:20px;">—<span class="metric-unit">K</span></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-label">FLOW / TRANSPORT</div>
+      <div class="metric-block">
+        <div class="metric-name">FLOW RATE</div>
+        <div class="metric-val" id="mFlow" style="color:var(--cyan);font-size:22px;">—<span class="metric-unit">LPM</span></div>
+        <div class="metric-bar"><div class="metric-bar-fill" id="bFlow" style="background:var(--cyan);width:33%"></div></div>
+      </div>
+      <div class="metric-block">
+        <div class="metric-name">I_LIMIT</div>
+        <div class="metric-val" id="mIlimit" style="color:var(--text);font-size:20px;">—<span class="metric-unit">A</span></div>
+      </div>
+      <div class="metric-block">
+        <div class="metric-name">TRANSPORT RATIO</div>
+        <div class="metric-val" id="mTransport" style="color:var(--yellow);font-size:20px;">—</div>
+        <div class="metric-bar"><div class="metric-bar-fill" id="bTransport" style="background:var(--yellow);width:10%"></div></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-label">DEGRADATION</div>
+      <div class="metric-block">
+        <div class="metric-name">CAPACITY</div>
+        <div class="metric-val" id="mCap" style="color:var(--text);font-size:20px;">—<span class="metric-unit">Ah</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ CONTROLS ═══ -->
+  <div class="controls-row">
+    <div class="control-group">
+      <div class="ctrl-label">Current Command (A) — (+) discharge / (−) charge</div>
+      <div class="ctrl-row">
+        <input type="range" class="ctrl-slider" id="sliderI" min="-200" max="200" step="5" value="120">
+        <div class="ctrl-val" id="valI">120 A</div>
+      </div>
+      <div class="ctrl-row">
+        <button class="btn dis"    onclick="setPreset(120)">DISCHARGE 120A</button>
+        <button class="btn charge" onclick="setPreset(-120)">CHARGE −120A</button>
+        <button class="btn stop"   onclick="setPreset(0)">STOP</button>
+      </div>
+    </div>
+    <div class="control-group">
+      <div class="ctrl-label">Flow Rate (LPM)</div>
+      <div class="ctrl-row">
+        <input type="range" class="ctrl-slider" id="sliderQ" min="5" max="60" step="1" value="20">
+        <div class="ctrl-val" id="valQ">20 LPM</div>
+      </div>
+    </div>
+    <div class="control-group">
+      <div class="ctrl-label">Ambient Temperature (K)</div>
+      <div class="ctrl-row">
+        <input type="range" class="ctrl-slider" id="sliderT" min="278" max="323" step="1" value="298">
+        <div class="ctrl-val" id="valT">298 K</div>
+      </div>
+    </div>
+    <div class="control-group" style="flex:0 0 160px; justify-content:center;">
+      <button class="btn reset-btn" onclick="resetSim()">⟳ RESET SIM</button>
+    </div>
+  </div>
+
+  <!-- ═══ STATS BAR ═══ -->
+  <div class="stats-row">
+    <div class="stat-cell">
+      <div class="stat-name">SIM TIME (10× speed)</div>
+      <div class="stat-val" id="statTime" style="color:var(--cyan)">—</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-name">STEPS</div>
+      <div class="stat-val" id="statSteps" style="color:var(--text-dim)">—</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-name">REN MAE (session)</div>
+      <div class="stat-val" id="statRenMae" style="color:var(--green)">—</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-name">CC MAE (session)</div>
+      <div class="stat-val" id="statCcMae" style="color:var(--orange)">—</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-name">REN IMPROVEMENT</div>
+      <div class="stat-val" id="statImprove" style="color:var(--yellow)">—</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-name">BMS LAYERS ACTIVE</div>
+      <div class="stat-val" id="statBms" style="color:var(--red)">0</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Chart.js setup ─────────────────────────────────────────────────────────
+const MAX_POINTS = 300;
+
+const chartDefaults = {
+  animation: false,
+  responsive: true,
+  maintainAspectRatio: false,
+  interaction: { mode: 'index', intersect: false },
+  plugins: {
+    legend: {
+      labels: {
+        color: '#5a7a9a',
+        font: { family: "'Barlow Condensed'", size: 11 },
+        boxWidth: 12,
+        padding: 16
+      }
+    },
+    tooltip: {
+      backgroundColor: '#0d1525',
+      borderColor: '#1e3050',
+      borderWidth: 1,
+      titleColor: '#c8d8f0',
+      bodyColor: '#5a7a9a',
+      titleFont: { family: "'Share Tech Mono'" },
+      bodyFont:  { family: "'Share Tech Mono'", size: 11 },
+    }
+  },
+  scales: {
+    x: {
+      grid:  { color: '#111d30' },
+      ticks: { color: '#2a4060', font: { family: "'Share Tech Mono'", size: 10 }, maxTicksLimit: 10 }
+    },
+    y: {
+      grid:  { color: '#111d30' },
+      ticks: { color: '#2a4060', font: { family: "'Share Tech Mono'", size: 10 } }
+    }
+  }
+};
+
+// SOC chart
+const socCtx = document.getElementById('socChart').getContext('2d');
+const socChart = new Chart(socCtx, {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [
+      { label: 'Ground Truth',   data: [], borderColor: '#00e5ff', borderWidth: 2,   pointRadius: 0, tension: 0.1 },
+      { label: 'REN Estimate',   data: [], borderColor: '#00ff9d', borderWidth: 1.5, pointRadius: 0, tension: 0.1, borderDash: [] },
+      { label: 'Coulomb Counter',data: [], borderColor: '#ff8c42', borderWidth: 1.5, pointRadius: 0, tension: 0.1, borderDash: [4,3] },
+    ]
+  },
+  options: { ...chartDefaults, scales: { ...chartDefaults.scales, y: { ...chartDefaults.scales.y, min: 0, max: 1 } } }
+});
+
+// Error chart
+const errCtx = document.getElementById('errChart').getContext('2d');
+const errChart = new Chart(errCtx, {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [
+      { label: '|REN − True|', data: [], borderColor: '#00ff9d', borderWidth: 1.5, pointRadius: 0, fill: true, backgroundColor: 'rgba(0,255,157,0.07)', tension: 0.1 },
+      { label: '|CC − True|',  data: [], borderColor: '#ff8c42', borderWidth: 1.5, pointRadius: 0, fill: true, backgroundColor: 'rgba(255,140,66,0.07)',  tension: 0.1 },
+    ]
+  },
+  options: { ...chartDefaults, scales: { ...chartDefaults.scales, y: { ...chartDefaults.scales.y, min: 0 } } }
+});
+
+function pushChart(t, soc_true, soc_cc, soc_ren, err_cc, err_ren) {
+  const lbl = `T+${t}s`;
+  [socChart, errChart].forEach(c => {
+    c.data.labels.push(lbl);
+    if (c.data.labels.length > MAX_POINTS) c.data.labels.shift();
+  });
+  const socD = socChart.data.datasets;
+  socD[0].data.push(soc_true); if (socD[0].data.length > MAX_POINTS) socD[0].data.shift();
+  socD[1].data.push(soc_ren);  if (socD[1].data.length > MAX_POINTS) socD[1].data.shift();
+  socD[2].data.push(soc_cc);   if (socD[2].data.length > MAX_POINTS) socD[2].data.shift();
+
+  const errD = errChart.data.datasets;
+  errD[0].data.push(err_ren); if (errD[0].data.length > MAX_POINTS) errD[0].data.shift();
+  errD[1].data.push(err_cc);  if (errD[1].data.length > MAX_POINTS) errD[1].data.shift();
+
+  socChart.update('none');
+  errChart.update('none');
+}
+
+function loadHistory(history) {
+  history.forEach(h => pushChart(h.t, h.soc_true, h.soc_cc, h.soc_ren, h.err_cc, h.err_ren));
+}
+
+// ── WebSocket ──────────────────────────────────────────────────────────────
+let ws, sessionErrRen = [], sessionErrCC = [];
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen    = () => {
+    document.getElementById('connDot').classList.add('live');
+    document.getElementById('connLabel').textContent = 'LIVE';
+  };
+  ws.onclose   = () => {
+    document.getElementById('connDot').classList.remove('live');
+    document.getElementById('connLabel').textContent = 'RECONNECTING';
+    setTimeout(connect, 2000);
+  };
+  ws.onmessage = e => {
+    const d = JSON.parse(e.data);
+    if (d.type === 'history') { loadHistory(d.history); return; }
+    if (d.type === 'step')    { updateDash(d); }
+  };
+}
+connect();
+
+// ── Dashboard update ───────────────────────────────────────────────────────
+function pct(v, lo, hi) { return Math.min(100, Math.max(0, (v-lo)/(hi-lo)*100)) + '%'; }
+
+function errClass(e) {
+  if (e < 0.015) return 'err-good';
+  if (e < 0.04)  return 'err-warn';
+  return 'err-bad';
+}
+
+function updateDash(d) {
+  // SOC displays
+  const socTrue = (d.soc_true * 100).toFixed(2) + '%';
+  const socRen  = (d.soc_ren  * 100).toFixed(2) + '%';
+  const socCC   = (d.soc_cc   * 100).toFixed(2) + '%';
+
+  document.getElementById('socTrue').textContent = socTrue;
+  document.getElementById('socRen').textContent  = socRen;
+  document.getElementById('socCC').textContent   = socCC;
+
+  document.getElementById('barTrue').style.width = pct(d.soc_true, 0, 1);
+  document.getElementById('barRen').style.width  = pct(d.soc_ren,  0, 1);
+  document.getElementById('barCC').style.width   = pct(d.soc_cc,   0, 1);
+
+  const eRen = document.getElementById('errRen');
+  eRen.textContent = `ERR: ${(d.err_ren*100).toFixed(3)}%`;
+  eRen.className = 'soc-error ' + errClass(d.err_ren);
+
+  const eCC = document.getElementById('errCC');
+  eCC.textContent = `ERR: ${(d.err_cc*100).toFixed(3)}%`;
+  eCC.className = 'soc-error ' + errClass(d.err_cc);
+
+  // Electrical
+  document.getElementById('mVoltage').innerHTML = `${d.voltage.toFixed(1)}<span class="metric-unit">V</span>`;
+  document.getElementById('mCurrent').innerHTML = `${d.current.toFixed(1)}<span class="metric-unit">A</span>`;
+  const power = Math.abs(d.voltage * d.current / 1000).toFixed(2);
+  document.getElementById('mPower').innerHTML   = `${power}<span class="metric-unit">kW</span>`;
+  document.getElementById('bVoltage').style.width = pct(d.voltage, 35, 70);
+  document.getElementById('bCurrent').style.width = pct(Math.abs(d.current), 0, 200);
+
+  // Thermal
+  document.getElementById('mTempStack').innerHTML = `${d.temp_stack.toFixed(1)}<span class="metric-unit">K</span>`;
+  document.getElementById('mTempTank').innerHTML  = `${d.temp_tank.toFixed(1)}<span class="metric-unit">K</span>`;
+  const tempPct = pct(d.temp_stack, 290, 330);
+  document.getElementById('bTemp').style.width = tempPct;
+  const tc = d.temp_stack >= 325 ? 'var(--red)' : d.temp_stack >= 318 ? 'var(--yellow)' : 'var(--orange)';
+  document.getElementById('bTemp').style.background = tc;
+
+  // Flow
+  document.getElementById('mFlow').innerHTML      = `${d.flow_lpm.toFixed(1)}<span class="metric-unit">LPM</span>`;
+  document.getElementById('mIlimit').innerHTML    = `${d.i_limit.toFixed(0)}<span class="metric-unit">A</span>`;
+  document.getElementById('mTransport').textContent = d.transport_ratio.toFixed(3);
+  document.getElementById('bFlow').style.width      = pct(d.flow_lpm, 0, 60);
+  document.getElementById('bTransport').style.width = pct(d.transport_ratio, 0, 1);
+  const tc2 = d.transport_ratio > 0.7 ? 'var(--red)' : d.transport_ratio > 0.5 ? 'var(--yellow)' : 'var(--green)';
+  document.getElementById('bTransport').style.background = tc2;
+
+  // Capacity
+  document.getElementById('mCap').innerHTML = `${d.capacity_ah.toFixed(0)}<span class="metric-unit">Ah</span>`;
+
+  // BMS
+  const f = d.bms_flags;
+  function setLayer(id, active, derate) {
+    const el = document.getElementById(id);
+    el.classList.remove('active', 'derate');
+    if (active) el.classList.add('active');
+    else if (derate) el.classList.add('derate');
+  }
+  setLayer('l1', f.voltage_cutoff, false);
+  setLayer('l2', f.soc_window,     false);
+  setLayer('l3', f.thermal_hard,   false);
+  setLayer('l4', false, f.thermal_derate);
+  setLayer('l5', false, f.i_limit_derate);
+  setLayer('l6', false, f.flow_derate);
+
+  document.getElementById('derateVal').textContent = d.bms_derate_pct.toFixed(1) + '%';
+  document.getElementById('currFlow').textContent  = `${d.current_cmd.toFixed(0)}A → ${d.current_safe.toFixed(0)}A`;
+
+  // Stats — show simulated time, not wall clock
+  const sim_s   = d.sim_time_s || d.t;
+  const sim_min = Math.floor(sim_s / 60);
+  const sim_sec = Math.floor(sim_s % 60);
+  const real_s  = Math.floor(d.elapsed_s);
+  document.getElementById('statTime').textContent  = `${sim_min}m ${sim_sec}s`;
+  document.getElementById('statSteps').textContent = d.t;
+  document.getElementById('headerTime').textContent = `SIM ${sim_min}m${sim_sec}s | REAL ${real_s}s`;
+
+  sessionErrRen.push(d.err_ren);
+  sessionErrCC.push(d.err_cc);
+  if (sessionErrRen.length > 3000) { sessionErrRen.shift(); sessionErrCC.shift(); }
+
+  const mae_ren = (sessionErrRen.reduce((a,b)=>a+b,0)/sessionErrRen.length*100).toFixed(3) + '%';
+  const mae_cc  = (sessionErrCC.reduce((a,b)=>a+b,0)/sessionErrCC.length*100).toFixed(3) + '%';
+  const avg_ren = sessionErrRen.reduce((a,b)=>a+b,0)/sessionErrRen.length;
+  const avg_cc  = sessionErrCC.reduce((a,b)=>a+b,0)/sessionErrCC.length;
+  const impr    = avg_cc > 0 ? ((1 - avg_ren/avg_cc)*100).toFixed(1) + '%' : '—';
+
+  document.getElementById('statRenMae').textContent = mae_ren;
+  document.getElementById('statCcMae').textContent  = mae_cc;
+  document.getElementById('statImprove').textContent = impr;
+
+  const nActive = Object.values(f).filter(Boolean).length;
+  document.getElementById('statBms').textContent = nActive;
+  document.getElementById('statBms').style.color = nActive > 0 ? 'var(--red)' : 'var(--green)';
+
+  pushChart(d.t, d.soc_true, d.soc_cc, d.soc_ren, d.err_cc, d.err_ren);
+}
+
+// ── Controls ───────────────────────────────────────────────────────────────
+function sendControl(obj) {
+  fetch('/control', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(obj) });
+}
+
+document.getElementById('sliderI').addEventListener('input', e => {
+  const v = parseFloat(e.target.value);
+  document.getElementById('valI').textContent = v + ' A';
+  sendControl({ I_cmd: v });
+});
+document.getElementById('sliderQ').addEventListener('input', e => {
+  const v = parseFloat(e.target.value);
+  document.getElementById('valQ').textContent = v + ' LPM';
+  sendControl({ flow_lpm: v });
+});
+document.getElementById('sliderT').addEventListener('input', e => {
+  const v = parseFloat(e.target.value);
+  document.getElementById('valT').textContent = v + ' K';
+  sendControl({ T_amb: v });
+});
+
+function setPreset(v) {
+  document.getElementById('sliderI').value = v;
+  document.getElementById('valI').textContent = v + ' A';
+  sendControl({ I_cmd: v });
+}
+
+function resetSim() {
+  sessionErrRen = []; sessionErrCC = [];
+  [socChart, errChart].forEach(c => {
+    c.data.labels = [];
+    c.data.datasets.forEach(d => d.data = []);
+    c.update();
+  });
+  sendControl({ reset: true });
+}
+</script>
+</body>
+</html>
