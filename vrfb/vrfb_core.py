@@ -218,16 +218,25 @@ class VRFB:
 
         (
             C_V2_s, C_V3_s, C_VO2_s, C_VO2plus_s,
-            C_V2_t, C_V3_t, _,       _,
+            C_V2_t, C_V3_t, C_VO2_t, C_VO2plus_t,
             T_s,    T_t,
             Q,      R_m,    Q_nom,    I_actual
         ) = self.state
 
-        # ── True SOC  (bulk tank, negative side) ─────────────────────────
-        soc = np.clip(
-            C_V2_t / (C_V2_t + C_V3_t + 1e-12),
-            0.0, 1.0
-        )
+        # ── Half-cell SOCs (bulk tank concentrations) ─────────────────────
+        # Negative side: V²⁺ / (V²⁺ + V³⁺)   — increases with charge
+        # Positive side: VO₂⁺/ (VO₂⁺ + VO²⁺) — increases with charge
+        soc_neg = np.clip(C_V2_t      / (C_V2_t      + C_V3_t  + 1e-12), 0.0, 1.0)
+        soc_pos = np.clip(C_VO2plus_t / (C_VO2plus_t + C_VO2_t + 1e-12), 0.0, 1.0)
+
+        # System SOC (paper Eq. 35): limited by the depleted half-cell.
+        # Kept separate from soc_true to maintain backward compat with the
+        # trained REN (which was fitted using the negative-side ratio as label).
+        soc_system    = float(min(soc_neg, soc_pos))
+        soc_imbalance = float(abs(soc_neg - soc_pos))
+
+        # soc_true preserved as negative-side ratio for REN compatibility
+        soc = soc_neg
 
         # ── Open-Circuit Voltage (Nernst, per cell) ───────────────────────
         # Full VRFB Nernst: E = E0 + (RT/F)·ln([VO₂⁺][V²⁺] / [VO²⁺][V³⁺])
@@ -285,14 +294,18 @@ class VRFB:
         return {
             "time"               : self.time,
             "soc_true"           : soc,
+            "soc_neg"            : soc_neg,
+            "soc_pos"            : soc_pos,
+            "soc_system"         : soc_system,
+            "soc_imbalance"      : soc_imbalance,
             "voltage_stack"      : voltage,
+            "current"            : I_actual,
+            "i_limit"            : I_limit,
+            "transport_ratio"    : transport_ratio,
             "temperature_stack"  : T_s,
             "temperature_tank"   : T_t,
             "flow_rate"          : Q,
+            "pump_power"         : pump_power,
             "membrane_resistance": R_m,
             "capacity_nominal"   : Q_nom,
-            "pump_power"         : pump_power,
-            "transport_ratio"    : transport_ratio,
-            "i_limit"            : I_limit,
-            "current"            : I_actual,
         }

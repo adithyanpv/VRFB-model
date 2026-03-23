@@ -1,15 +1,15 @@
 REN vs CC vs Ground Truth — Test Set Summary
 ==================================================
-Test episodes : 16
-Total rows    : 288,000
+Test episodes : 24
+Total rows    : 432,000
 
 Metric                    REN          CC   Improvement
 ------------------------------------------------------
-RMSE                  0.01071     0.04734        +77.4%
-MAE                   0.00802     0.03896        +79.4%
-Max Error             0.24407     0.09744       -150.5%
-Mean Bias             0.00067     0.02713             —
+RMSE                  0.07759     0.14172        +45.3%
+MAE                   0.05811     0.11637        +50.1%
+Max Error             0.33753     0.33851         +0.3%
+Mean Bias            -0.02102    -0.06438             —
 
 Per-episode RMSE:
-  REN  mean=0.00988  min=0.00409  max=0.01850
-  CC   mean=0.03905  min=0.00301  max=0.09682
+  REN  mean=0.06512  min=0.02347  max=0.20950
+  CC   mean=0.11646  min=0.00430  max=0.33350

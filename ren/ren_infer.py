@@ -1,6 +1,6 @@
 # ren/infer_ren.py
 """
-REN Inference & Comparison Script
+REN Inference & Comparison Script  (v3 — 9 features)
 ===================================
 Loads the trained REN model and runs it episode-by-episode on the test set.
 Produces a full comparison of:
@@ -41,12 +41,12 @@ from ren.ren_model import REN
 # ── Config — must match train_ren.py exactly ─────────────────────────────────
 FEATURE_COLS = [
     "voltage", "current", "temperature_stack", "temperature_tank",
-    "flow_rate", "soc_cc", "I_limit", "transport_ratio"
+    "flow_rate",
 ]
 TARGET_COL  = "SOC_true"
-INPUT_DIM   = 8
+INPUT_DIM   = 5
 HIDDEN_DIM  = 128
-ALPHA       = 0.95
+ALPHA       = 0.5    # match train_ren.py v3
 DROPOUT     = 0.0     # disable dropout at inference
 
 TEST_CSV    = "datasets/vrfb_test.csv"
@@ -97,6 +97,7 @@ def run_ren_on_episode(model, scaler, X_ep: np.ndarray) -> np.ndarray:
     X_t      = torch.tensor(X_scaled).unsqueeze(0).to(DEVICE)  # [1, T, 8]
 
     with torch.no_grad():
+        # z=None -> use model's learned z0 initial state
         y_seq, _ = model(X_t, z=None)   # [1, T, 1]
 
     return y_seq.squeeze().cpu().numpy()   # [T]
@@ -309,8 +310,14 @@ def main(max_episode_plots: int = 999):
     print("=" * 65)
 
     # Load model
-    model = REN(input_dim=INPUT_DIM, hidden_dim=HIDDEN_DIM,
-                output_dim=1, alpha=ALPHA, dropout=DROPOUT).to(DEVICE)
+    model = REN(
+        input_dim     = INPUT_DIM,
+        hidden_dim    = HIDDEN_DIM,
+        output_dim    = 1,
+        alpha         = 0.5,       # match train_ren.py v3 default
+        dropout       = DROPOUT,
+        n_power_iters = 10,
+    ).to(DEVICE)
     model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
     model.eval()
     print(f"  Model    : {MODEL_PATH}")

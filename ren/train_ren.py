@@ -1,33 +1,43 @@
-# ren/train_ren.py
 """
-REN Training Script — VRFB SOC Estimator  (v2, fixed)
-=======================================================
+REN Training Script — VRFB SOC Estimator  (v3)
+===============================================
 
-BUGS FIXED FROM v1:
-  1. FEATURE_COLS wrong  — used "temperature", "flow", "dVdt", "dIdt"
-                           correct: "temperature_stack", "temperature_tank",
-                                    "flow_rate", "soc_cc"
-  2. Wrong dataset file  — used vrfb_dataset.csv (all 80 episodes mixed)
-                           correct: vrfb_train.csv / vrfb_test.csv (pre-split)
-  3. Row-level chunking  — reshaped all rows flat, crossing episode boundaries
-                           correct: chunk within each episode independently
-  4. VAL_SPLIT row-level — random 20% of chunks regardless of episode
-                           correct: use the separate test CSV (episode-split)
-  5. Wrong import path   — "from ren_model import REN"
-                           correct: "from ren.ren_model import REN"
-  6. RMSE recalculation  — second forward pass in val loop (slow, wasteful)
-                           fixed: accumulate squared errors inline
-  7. Hidden state leaks across episodes in val loop — fixed with z=None per episode
+IMPROVEMENTS OVER v2
+---------------------
 
-TRAINING STRATEGY:
-  - Episode-aware chunking: each episode → N chunks of SEQ_LEN steps
-  - Each chunk starts with z = 0 (valid because REN contractivity guarantees
-    the hidden state forgets its initial condition within ~50 steps)
-  - Truncated BPTT: z.detach() between chunks (prevents vanishing gradients
-    across thousands of steps)
-  - Loss: 0.7 × MSE + 0.3 × MAE
-  - Cosine annealing LR: smooth decay, avoids oscillation in final epochs
-  - Early stopping on val loss with patience=12
+1. Stateful episode training  (most important)
+   Problem: v2 always starts every chunk with z=0. At inference z carries
+   forward continuously for 18,000 steps. This train/inference mismatch
+   means the model never learns to use a warm hidden state during training,
+   wasting the REN's memory capacity.
+
+   Fix: EpisodeStatefulLoader processes episodes as ordered sequences.
+   z is carried forward between consecutive chunks of the same episode
+   using z.detach() (truncated BPTT boundary). Episodes are shuffled each
+   epoch so ordering within the episode is preserved but episode order
+   is not. Each epoch sees all data.
+
+2. Warmup-step masking
+   The first WARMUP_STEPS steps of each chunk (while z recovers from the
+   chunk's starting state) do not contribute to the loss. This prevents
+   systematically-high early errors from drowning out the signal from
+   steps where z has meaningful context.
+
+3. Linear LR warmup
+   Avoids large early gradients destabilising the spectral-norm projection
+   on A_free. LR ramps linearly over LR_WARMUP_EPOCHS, then cosine decays.
+
+4. Boundary-weighted loss
+   Errors near soc_min and soc_max are safety-critical (BMS protection
+   triggers). An exponential boundary weight upweights those samples in
+   the MSE component without affecting the MAE term.
+
+5. Diagnostic logging
+   Tracks z0 norm and contraction rate across epochs.
+
+FEATURE COLS (9):
+  voltage, current, temperature_stack, temperature_tank,
+  flow_rate, soc_cc, I_limit, transport_ratio, soc_imbalance
 
 OUTPUT FILES:
   ren/scaler.pkl          — StandardScaler fitted on training features only
@@ -35,9 +45,6 @@ OUTPUT FILES:
   ren/ren_soc_last.pth    — final epoch model
   ren/training_log.csv    — epoch metrics
   ren/training_curves.png — loss + RMSE + LR curves
-
-USAGE:
-  python -m ren.train_ren
 """
 
 import os
@@ -47,54 +54,62 @@ import math
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")          # non-interactive backend — safe on all platforms
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
 from sklearn.preprocessing import StandardScaler
 
 from ren.ren_model import REN
 
-# ── Reproducibility ───────────────────────────────────────────────────────────
+# ── Reproducibility ──────────────────────────────────────────────────────────
 SEED = 42
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION  ← change these if you want to experiment
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
 # Model
-HIDDEN_DIM   = 128
-ALPHA        = 0.95      # contractivity: σ_max(A_bar) < (1 - ALPHA) = 0.05
-DROPOUT      = 0.1
+HIDDEN_DIM      = 128
+ALPHA           = 0.5      # sigma_max(A_bar) < 0.5  (was 0.95 → too tight)
+DROPOUT         = 0.1
+N_POWER_ITERS   = 10
 
-# Data — must match dataset_gen.py v2 column names exactly
+# Features — must match dataset_gen.py v3 exactly
+# Strictly physically measurable signals — no derived values, no CC output.
+# This makes the comparison with Coulomb Counting honest:
+# CC uses only current (integral of I*dt).
+# REN uses voltage + current + temperature + flow — strictly more information.
 FEATURE_COLS = [
-    "voltage",            # stack terminal voltage [V]   — encodes Nernst SOC curve
-    "current",            # actual current after BMS [A] — encodes charge/discharge direction
-    "temperature_stack",  # stack thermocouple [K]       — affects OCV and crossover rate
-    "temperature_tank",   # tank thermocouple [K]        — thermal lag, slow dynamics
-    "flow_rate",          # electrolyte flow [m³/s]      — determines I_limit
-    "soc_cc",             # Coulomb counter SOC [-]      — REN corrects this drift
-    "I_limit",            # mass transport limit [A]     — encodes flow/concentration stress
-    "transport_ratio",    # |I| / I_limit [-]            — how close to starvation
+    "voltage",            # stack terminal voltage [V]   — Nernst equation encodes SOC
+    "current",            # stack current [A]            — same signal CC integrates
+    "temperature_stack",  # stack thermocouple [K]       — affects OCV via RT/nF
+    "temperature_tank",   # tank thermocouple [K]        — thermal lag dynamics
+    "flow_rate",          # electrolyte flow [m3/s]      — mass transport conditions
 ]
-TARGET_COL   = "SOC_true"
-INPUT_DIM    = len(FEATURE_COLS)   # 8
+TARGET_COL = "SOC_true"
+INPUT_DIM  = len(FEATURE_COLS)   # 5
 
 # Training
-SEQ_LEN      = 256       # steps per chunk — 256s per sequence
-BATCH_SIZE   = 64        # chunks per gradient step
-EPOCHS       = 80
-LR           = 3e-4
-WEIGHT_DECAY = 1e-5
-PATIENCE     = 12        # early stopping: stop if val doesn't improve for 12 epochs
-GRAD_CLIP    = 1.0
-MSE_WEIGHT   = 0.7
-MAE_WEIGHT   = 0.3
+SEQ_LEN          = 256    # steps per BPTT chunk
+BATCH_SIZE       = 32     # episodes processed in parallel per gradient step
+                           # (lower than v2 because each episode yields many chunks)
+EPOCHS           = 80
+LR               = 3e-4
+LR_WARMUP_EPOCHS = 5      # linear LR ramp-up before cosine decay
+WEIGHT_DECAY     = 1e-5
+PATIENCE         = 15     # increased from 12 (stateful training converges slower)
+GRAD_CLIP        = 1.0
+WARMUP_STEPS     = 32     # steps per chunk excluded from loss (z settling)
+MSE_WEIGHT       = 0.7
+MAE_WEIGHT       = 0.3
+BOUNDARY_SCALE   = 3.0    # extra MSE weight multiplier near soc_min/soc_max
+SOC_MIN          = 0.05   # BMS protection limits (must match config.py)
+SOC_MAX          = 0.95
 
 # Paths
 TRAIN_CSV = "datasets/vrfb_train.csv"
@@ -105,152 +120,250 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DATASET — episode-aware chunking
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# DATA LOADING — stateful episode format
+# =============================================================================
 
-class EpisodeChunkDataset(Dataset):
+def load_episodes(
+    df:          pd.DataFrame,
+    scaler:      StandardScaler,
+    fit_scaler:  bool = False,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """
-    Splits each episode into fixed-length SEQ_LEN chunks.
-    Chunks never cross episode boundaries — this prevents the model
-    from learning spurious correlations between the end of one episode
-    and the start of the next (which would have different initial SOC,
-    temperature and flow profile).
+    Returns a list of (X_ep, y_ep) tensors, one per episode, spanning
+    the full episode length.  Chunking is done during the training loop
+    so that z can be carried forward between chunks.
 
-    Each item: (X_chunk [SEQ_LEN, 8], y_chunk [SEQ_LEN, 1])
-    Hidden state z is initialised to 0 for every chunk in the DataLoader.
-    This is valid because the REN contractivity guarantee means z forgets
-    its initial condition within ~50 steps regardless of starting value.
+    X_ep : (episode_len, input_dim)  float32
+    y_ep : (episode_len, 1)          float32
     """
+    X_all = df[FEATURE_COLS].values.astype(np.float32)
+    y_all = df[TARGET_COL].values.astype(np.float32)
 
-    def __init__(self, df: pd.DataFrame, scaler: StandardScaler,
-                 seq_len: int, fit_scaler: bool = False):
+    if fit_scaler:
+        scaler.fit(X_all)
+    X_scaled = scaler.transform(X_all).astype(np.float32)
 
-        self.chunks_X = []
-        self.chunks_y = []
+    episodes = []
+    for _, group in df.groupby("episode_id", sort=True):
+        idx  = group.index
+        X_ep = torch.tensor(X_scaled[idx], dtype=torch.float32)
+        y_ep = torch.tensor(y_all[idx],    dtype=torch.float32).unsqueeze(-1)
+        episodes.append((X_ep, y_ep))
 
-        X_all = df[FEATURE_COLS].values.astype(np.float32)
-        y_all = df[TARGET_COL].values.astype(np.float32)
-
-        # Fit scaler on training data only (never on test data)
-        if fit_scaler:
-            scaler.fit(X_all)
-        X_scaled = scaler.transform(X_all).astype(np.float32)
-
-        # Chunk per episode
-        for _, group in df.groupby("episode_id", sort=True):
-            idx   = group.index
-            X_ep  = X_scaled[idx]
-            y_ep  = y_all[idx]
-            n_ep  = len(X_ep)
-
-            n_chunks = n_ep // seq_len
-            for i in range(n_chunks):
-                s = i * seq_len
-                e = s + seq_len
-                self.chunks_X.append(
-                    torch.tensor(X_ep[s:e], dtype=torch.float32)
-                )
-                self.chunks_y.append(
-                    torch.tensor(y_ep[s:e], dtype=torch.float32).unsqueeze(-1)
-                )
-
-    def __len__(self):
-        return len(self.chunks_X)
-
-    def __getitem__(self, idx):
-        return self.chunks_X[idx], self.chunks_y[idx]
+    return episodes
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # LOSS
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
-def composite_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    mse = nn.functional.mse_loss(pred, target)
-    mae = nn.functional.l1_loss(pred,  target)
-    return MSE_WEIGHT * mse + MAE_WEIGHT * mae
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TRAIN / EVAL FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def run_epoch(model, loader, optimiser=None):
+def composite_loss(
+    pred:   torch.Tensor,   # (batch, seq, 1)
+    target: torch.Tensor,   # (batch, seq, 1)
+) -> torch.Tensor:
     """
-    Single epoch of training (optimiser provided) or evaluation (optimiser=None).
-    Returns (mean_loss, rmse, mae, max_error).
+    Boundary-weighted MSE + MAE.
+
+    The MSE component upweights samples where the true SOC is close to
+    soc_min or soc_max.  These are the safety-critical regions where BMS
+    protection triggers; an error of 0.01 near soc_min can cause an
+    unwanted shutdown or over-discharge.
+
+    Weight function: 1 + BOUNDARY_SCALE * (exp(-50*(y-soc_min)) +
+                                            exp(-50*(soc_max-y)))
+    This is ~1.0 in the mid-SOC range and rises to ~(1+BOUNDARY_SCALE)
+    within ~0.1 SOC units of either limit.
+    """
+    # Boundary weight (no gradient through target)
+    with torch.no_grad():
+        w = 1.0 + BOUNDARY_SCALE * (
+            torch.exp(-50.0 * (target - SOC_MIN).clamp(min=0.0)) +
+            torch.exp(-50.0 * (SOC_MAX - target).clamp(min=0.0))
+        )
+
+    sq_err      = (pred - target) ** 2
+    weighted_mse = (w * sq_err).mean()
+    mae          = F.l1_loss(pred, target)
+
+    return MSE_WEIGHT * weighted_mse + MAE_WEIGHT * mae
+
+
+# =============================================================================
+# TRAINING — stateful episode loop
+# =============================================================================
+
+def run_stateful_epoch(
+    model:        REN,
+    episodes:     list,
+    optimiser:    torch.optim.Optimizer | None,
+    warmup_steps: int,
+) -> tuple[float, float, float, float]:
+    """
+    Stateful episode training epoch.
+
+    For each episode:
+      - z starts from model.z0 (learned initial state)
+      - Chunks are processed in order; z carries forward with .detach()
+        between chunks (truncated BPTT — gradient does not flow across
+        chunk boundaries, preventing vanishing gradients over 18,000 steps)
+      - Loss is computed only on steps [warmup_steps:] of each chunk
+
+    Episodes are grouped into mini-batches of BATCH_SIZE for parallel
+    processing.  Episode order within a batch is consistent chunk-by-chunk
+    so z aligns correctly between chunks.  Episode groups are shuffled
+    each epoch.
     """
     is_train = optimiser is not None
     model.train() if is_train else model.eval()
 
-    total_loss = 0.0
-    sq_errors  = []
-    abs_errors = []
+    # Shuffle episode order each epoch
+    perm = torch.randperm(len(episodes)).tolist()
 
-    ctx = torch.enable_grad() if is_train else torch.no_grad()
+    total_loss  = 0.0
+    sq_errors   = []
+    abs_errors  = []
+    n_batches   = 0
 
-    with ctx:
-        for X_batch, y_batch in loader:
-            X_batch = X_batch.to(DEVICE)   # [B, SEQ_LEN, 8]
-            y_batch = y_batch.to(DEVICE)   # [B, SEQ_LEN, 1]
+    ctx = torch.enable_grad if is_train else torch.no_grad
 
-            # z=None → initialised to zeros inside model.forward()
-            y_pred, _ = model(X_batch, z=None)
+    for batch_start in range(0, len(perm), BATCH_SIZE):
+        batch_idxs = perm[batch_start : batch_start + BATCH_SIZE]
+        batch_eps  = [episodes[i] for i in batch_idxs]
+        B          = len(batch_eps)
 
-            loss = composite_loss(y_pred, y_batch)
-            total_loss += loss.item()
+        # Minimum episode length in this batch (safe chunking)
+        min_len  = min(ep[0].shape[0] for ep in batch_eps)
+        n_chunks = min_len // SEQ_LEN
+        if n_chunks == 0:
+            continue
 
-            err = (y_pred - y_batch).detach().cpu().numpy().flatten()
-            sq_errors.append(err ** 2)
-            abs_errors.append(np.abs(err))
+        # Initialise z from learned z0
+        z = model.z0.expand(B, -1).contiguous().to(DEVICE)
+        if is_train:
+            z = z.detach()
 
-            if is_train:
-                optimiser.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-                optimiser.step()
+        batch_loss_sum = 0.0
 
-    sq_errors  = np.concatenate(sq_errors)
-    abs_errors = np.concatenate(abs_errors)
+        for chunk_idx in range(n_chunks):
+            s = chunk_idx * SEQ_LEN
+            e = s + SEQ_LEN
+
+            X_chunk = torch.stack(
+                [ep[0][s:e] for ep in batch_eps]
+            ).to(DEVICE)   # (B, SEQ_LEN, input_dim)
+
+            y_chunk = torch.stack(
+                [ep[1][s:e] for ep in batch_eps]
+            ).to(DEVICE)   # (B, SEQ_LEN, 1)
+
+            with ctx():
+                y_pred, z_next = model(X_chunk, z=z)
+
+                # Warmup masking: skip first warmup_steps from loss
+                if warmup_steps > 0 and SEQ_LEN > warmup_steps:
+                    y_pred_l  = y_pred[:, warmup_steps:, :]
+                    y_chunk_l = y_chunk[:, warmup_steps:, :]
+                else:
+                    y_pred_l  = y_pred
+                    y_chunk_l = y_chunk
+
+                loss = composite_loss(y_pred_l, y_chunk_l)
+                batch_loss_sum += loss.item()
+
+                err = (y_pred_l - y_chunk_l).detach().cpu().numpy().ravel()
+                sq_errors.append(err ** 2)
+                abs_errors.append(np.abs(err))
+
+                if is_train:
+                    optimiser.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                    optimiser.step()
+
+            # Carry z forward — detach to truncate BPTT at chunk boundary
+            z = z_next.detach()
+
+        total_loss += batch_loss_sum / max(n_chunks, 1)
+        n_batches  += 1
+
+    sq_all  = np.concatenate(sq_errors)
+    abs_all = np.concatenate(abs_errors)
 
     return (
-        total_loss / len(loader),
-        math.sqrt(sq_errors.mean()),
-        abs_errors.mean(),
-        abs_errors.max(),
+        total_loss / max(n_batches, 1),
+        math.sqrt(sq_all.mean()),
+        abs_all.mean(),
+        abs_all.max(),
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# LEARNING RATE SCHEDULE
+# =============================================================================
+
+def get_lr(epoch: int, optimiser: torch.optim.Optimizer) -> float:
+    return optimiser.param_groups[0]["lr"]
+
+
+class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
+    """
+    Linear warmup for LR_WARMUP_EPOCHS epochs, then cosine annealing
+    to LR * 0.01.  Avoids destabilising the spectral-norm projection
+    on A_free with large early gradients.
+    """
+
+    def __init__(self, optimiser, warmup_epochs, total_epochs, min_lr_ratio=0.01):
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs  = total_epochs
+        self.min_lr_ratio  = min_lr_ratio
+        super().__init__(optimiser)
+
+    def get_lr(self):
+        e = self.last_epoch
+        if e < self.warmup_epochs:
+            scale = (e + 1) / self.warmup_epochs
+        else:
+            progress = (e - self.warmup_epochs) / max(
+                self.total_epochs - self.warmup_epochs, 1
+            )
+            scale = self.min_lr_ratio + 0.5 * (1.0 - self.min_lr_ratio) * (
+                1.0 + math.cos(math.pi * progress)
+            )
+        return [base_lr * scale for base_lr in self.base_lrs]
+
+
+# =============================================================================
 # MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def main():
     print("\n" + "=" * 65)
-    print("  REN Training  —  VRFB SOC Estimator  (v2)")
+    print("  REN Training  —  VRFB SOC Estimator  (v3, stateful)")
     print("=" * 65)
-    print(f"  Device      : {DEVICE}")
-    print(f"  Hidden dim  : {HIDDEN_DIM}   Alpha : {ALPHA}   Dropout : {DROPOUT}")
-    print(f"  Seq len     : {SEQ_LEN}     Batch : {BATCH_SIZE}   Epochs : {EPOCHS}")
-    print(f"  LR          : {LR}   Patience : {PATIENCE}")
-    print(f"  Loss        : {MSE_WEIGHT}×MSE + {MAE_WEIGHT}×MAE")
-    print(f"  Features    : {FEATURE_COLS}")
+    print(f"  Device         : {DEVICE}")
+    print(f"  Hidden dim     : {HIDDEN_DIM}   Alpha : {ALPHA}   Dropout : {DROPOUT}")
+    print(f"  Power iters    : {N_POWER_ITERS}  (spectral norm)")
+    print(f"  Seq len        : {SEQ_LEN}     Batch : {BATCH_SIZE}   Epochs : {EPOCHS}")
+    print(f"  LR             : {LR}   Warmup : {LR_WARMUP_EPOCHS} epochs   Patience : {PATIENCE}")
+    print(f"  Loss           : {MSE_WEIGHT}xMSE(boundary-weighted) + {MAE_WEIGHT}xMAE")
+    print(f"  Warmup steps   : {WARMUP_STEPS}  (masked from loss per chunk)")
+    print(f"  Training mode  : STATEFUL (z carried between chunks per episode)")
+    print(f"  Features ({INPUT_DIM})   : {FEATURE_COLS}")
     print("-" * 65)
 
-    # ── Load CSVs ─────────────────────────────────────────────────────────────
+    # ── Load data ─────────────────────────────────────────────────────────
     print("\nLoading data...")
     df_train = pd.read_csv(TRAIN_CSV)
     df_test  = pd.read_csv(TEST_CSV)
 
-    # Validate columns exist
     missing = [c for c in FEATURE_COLS + [TARGET_COL, "episode_id"]
                if c not in df_train.columns]
     if missing:
         raise ValueError(
             f"Missing columns in training CSV: {missing}\n"
-            f"Available columns: {list(df_train.columns)}\n"
-            f"Did you run dataset_gen.py v2?"
+            f"Available: {list(df_train.columns)}\n"
+            f"Did you run dataset_gen.py v3?"
         )
 
     print(f"  Train : {len(df_train):>9,} rows  "
@@ -258,67 +371,57 @@ def main():
     print(f"  Test  : {len(df_test):>9,} rows  "
           f"({df_test['episode_id'].nunique()} episodes)")
 
-    soc_min = df_train[TARGET_COL].min()
-    soc_max = df_train[TARGET_COL].max()
-    print(f"  SOC range in train : {soc_min:.3f} – {soc_max:.3f}")
-
-    # ── Scaler (fit on train only) ────────────────────────────────────────────
-    scaler   = StandardScaler()
-    train_ds = EpisodeChunkDataset(df_train, scaler, SEQ_LEN, fit_scaler=True)
-    test_ds  = EpisodeChunkDataset(df_test,  scaler, SEQ_LEN, fit_scaler=False)
+    # ── Scaler (fit on train features only) ──────────────────────────────
+    scaler       = StandardScaler()
+    train_eps    = load_episodes(df_train, scaler, fit_scaler=True)
+    test_eps     = load_episodes(df_test,  scaler, fit_scaler=False)
 
     scaler_path = os.path.join(SAVE_DIR, "scaler.pkl")
     with open(scaler_path, "wb") as f:
         pickle.dump(scaler, f)
-    print(f"\n  Scaler saved → {scaler_path}")
+    print(f"\n  Scaler saved -> {scaler_path}")
+    print(f"  Train episodes : {len(train_eps)}   "
+          f"chunks/ep : ~{train_eps[0][0].shape[0] // SEQ_LEN}")
+    print(f"  Test  episodes : {len(test_eps)}")
 
-    print(f"  Train chunks : {len(train_ds):,}   "
-          f"Test chunks : {len(test_ds):,}")
+    # ── CC baseline on test set ───────────────────────────────────────────
+    cc_errors = np.abs(df_test[TARGET_COL].values - df_test["soc_cc"].values)
+    cc_rmse   = math.sqrt(np.mean(cc_errors ** 2))
+    cc_mae    = cc_errors.mean()
+    cc_max    = cc_errors.max()
 
-    train_loader = DataLoader(
-        train_ds, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=0, pin_memory=(DEVICE.type == "cuda")
-    )
-    test_loader = DataLoader(
-        test_ds, batch_size=BATCH_SIZE, shuffle=False,
-        num_workers=0, pin_memory=(DEVICE.type == "cuda")
-    )
-
-    # ── Model ─────────────────────────────────────────────────────────────────
+    # ── Model ─────────────────────────────────────────────────────────────
     model = REN(
-        input_dim  = INPUT_DIM,
-        hidden_dim = HIDDEN_DIM,
-        output_dim = 1,
-        alpha      = ALPHA,
-        dropout    = DROPOUT,
+        input_dim     = INPUT_DIM,
+        hidden_dim    = HIDDEN_DIM,
+        output_dim    = 1,
+        alpha         = ALPHA,
+        dropout       = DROPOUT,
+        n_power_iters = N_POWER_ITERS,
     ).to(DEVICE)
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_params = model.count_parameters()
     init_cr  = model.contraction_rate()
     print(f"\n  Parameters       : {n_params:,}")
     print(f"  Contraction rate : {init_cr:.4f}  (enforced < {1-ALPHA:.2f})")
+    print(f"  z0 norm (init)   : {model.z0_norm():.4f}")
 
-    # ── Optimiser + Scheduler ─────────────────────────────────────────────────
+    # ── Optimiser + Scheduler ─────────────────────────────────────────────
     optimiser = torch.optim.AdamW(
         model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimiser, T_max=EPOCHS, eta_min=LR * 0.01
+    scheduler = WarmupCosineScheduler(
+        optimiser,
+        warmup_epochs = LR_WARMUP_EPOCHS,
+        total_epochs  = EPOCHS,
+        min_lr_ratio  = 0.01,
     )
 
-    # ── CC baseline on test set (for comparison table at the end) ─────────────
-    cc_errors = np.abs(
-        df_test[TARGET_COL].values - df_test["soc_cc"].values
-    )
-    cc_rmse  = math.sqrt(np.mean(cc_errors ** 2))
-    cc_mae   = cc_errors.mean()
-    cc_max   = cc_errors.max()
-
-    # ── Training loop ─────────────────────────────────────────────────────────
+    # ── Training loop ─────────────────────────────────────────────────────
     print(f"\n  {'Ep':>4}  {'Trn Loss':>10}  {'Val Loss':>10}  "
           f"{'Val RMSE':>10}  {'Val MAE':>9}  {'MaxErr':>8}  "
-          f"{'CR':>7}  {'LR':>9}")
-    print("  " + "-" * 80)
+          f"{'CR':>7}  {'z0‖':>6}  {'LR':>9}")
+    print("  " + "-" * 88)
 
     best_val_loss  = math.inf
     patience_count = 0
@@ -329,12 +432,17 @@ def main():
     for epoch in range(1, EPOCHS + 1):
         t_ep = time.time()
 
-        trn_loss, trn_rmse, trn_mae, _       = run_epoch(model, train_loader, optimiser)
-        val_loss, val_rmse, val_mae, val_max  = run_epoch(model, test_loader,  None)
+        trn_loss, trn_rmse, trn_mae, _ = run_stateful_epoch(
+            model, train_eps, optimiser, WARMUP_STEPS
+        )
+        val_loss, val_rmse, val_mae, val_max = run_stateful_epoch(
+            model, test_eps, None, WARMUP_STEPS
+        )
         scheduler.step()
 
         cr         = model.contraction_rate()
-        current_lr = scheduler.get_last_lr()[0]
+        z0_n       = model.z0_norm()
+        current_lr = get_lr(epoch, optimiser)
         ep_secs    = time.time() - t_ep
 
         t_losses.append(trn_loss)
@@ -345,7 +453,7 @@ def main():
         log.append(dict(
             epoch=epoch, trn_loss=trn_loss, val_loss=val_loss,
             val_rmse=val_rmse, val_mae=val_mae, val_max=val_max,
-            contraction_rate=cr, lr=current_lr
+            contraction_rate=cr, z0_norm=z0_n, lr=current_lr
         ))
 
         marker = ""
@@ -360,7 +468,7 @@ def main():
 
         print(f"  {epoch:>4d}  {trn_loss:>10.6f}  {val_loss:>10.6f}  "
               f"{val_rmse:>10.5f}  {val_mae:>9.5f}  {val_max:>8.5f}  "
-              f"{cr:>7.4f}  {current_lr:>9.2e}"
+              f"{cr:>7.4f}  {z0_n:>6.3f}  {current_lr:>9.2e}"
               f"  [{ep_secs:.0f}s]{marker}")
 
         if patience_count >= PATIENCE:
@@ -368,18 +476,20 @@ def main():
                   f"(no improvement for {PATIENCE} epochs)")
             break
 
-    # ── Save last model + log ─────────────────────────────────────────────────
+    # ── Save last model + log ─────────────────────────────────────────────
     torch.save(model.state_dict(), os.path.join(SAVE_DIR, "ren_soc_last.pth"))
     pd.DataFrame(log).to_csv(
         os.path.join(SAVE_DIR, "training_log.csv"), index=False
     )
 
-    # ── Final metrics using best model ────────────────────────────────────────
+    # ── Final metrics using best model ────────────────────────────────────
     model.load_state_dict(
         torch.load(os.path.join(SAVE_DIR, "ren_soc_best.pth"),
                    map_location=DEVICE)
     )
-    _, ren_rmse, ren_mae, ren_max = run_epoch(model, test_loader, None)
+    _, ren_rmse, ren_mae, ren_max = run_stateful_epoch(
+        model, test_eps, None, WARMUP_STEPS
+    )
 
     print(f"\n{'=' * 65}")
     print(f"  FINAL RESULTS — best model vs Coulomb Counter baseline")
@@ -394,22 +504,22 @@ def main():
           f"{(1 - ren_max / cc_max) * 100:>10.1f}%")
     print(f"\n  Total training time : {(time.time() - t0) / 60:.1f} min")
     print(f"  Best val loss       : {best_val_loss:.6f}")
-    print(f"  Final contraction   : {model.contraction_rate():.4f}")
+    print(f"  Final contraction   : {model.contraction_rate():.4f}  "
+          f"(target < {1-ALPHA:.2f})")
+    print(f"  Final z0 norm       : {model.z0_norm():.4f}")
     print(f"{'=' * 65}")
 
-    # ── Training curves ───────────────────────────────────────────────────────
+    # ── Training curves ───────────────────────────────────────────────────
     epochs_x = list(range(1, len(t_losses) + 1))
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
 
-    # Loss
-    axes[0].plot(epochs_x, t_losses, label="Train loss", color="steelblue", lw=1.5)
-    axes[0].plot(epochs_x, v_losses, label="Val loss",   color="tomato",    lw=1.5)
+    axes[0].plot(epochs_x, t_losses, label="Train", color="steelblue", lw=1.5)
+    axes[0].plot(epochs_x, v_losses, label="Val",   color="tomato",    lw=1.5)
     axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Loss")
     axes[0].set_title("Training & Validation Loss")
     axes[0].legend(); axes[0].grid(True, alpha=0.4)
 
-    # RMSE vs CC baseline
     axes[1].plot(epochs_x, v_rmses, color="purple", lw=2, label="REN Val RMSE")
     axes[1].axhline(cc_rmse, color="orange", ls="--", lw=1.5,
                     label=f"CC RMSE = {cc_rmse:.4f}")
@@ -417,20 +527,37 @@ def main():
     axes[1].set_title("Val RMSE vs CC Baseline")
     axes[1].legend(); axes[1].grid(True, alpha=0.4)
 
-    # LR schedule
     axes[2].plot(epochs_x, lrs_list, color="green", lw=1.5)
     axes[2].set_xlabel("Epoch"); axes[2].set_ylabel("Learning Rate")
-    axes[2].set_title("Cosine LR Schedule")
+    axes[2].set_title(f"LR Schedule (warmup {LR_WARMUP_EPOCHS} ep)")
     axes[2].grid(True, alpha=0.4)
 
-    plt.suptitle("REN Training — VRFB SOC Estimator", fontsize=12, y=1.02)
+    cr_vals = [row["contraction_rate"] for row in log]
+    z0_vals = [row["z0_norm"]          for row in log]
+    ax4a = axes[3]
+    ax4b = ax4a.twinx()
+    ax4a.plot(epochs_x, cr_vals, color="coral",  lw=1.5, label="σ_max(A_bar)")
+    ax4a.axhline(1.0 - ALPHA, color="coral", ls="--", lw=1,
+                 label=f"limit {1-ALPHA:.2f}")
+    ax4b.plot(epochs_x, z0_vals, color="teal",   lw=1.5, ls=":", label="‖z0‖")
+    ax4a.set_xlabel("Epoch")
+    ax4a.set_ylabel("Contraction rate", color="coral")
+    ax4b.set_ylabel("‖z0‖", color="teal")
+    ax4a.set_title("Contractivity & z0 evolution")
+    ax4a.grid(True, alpha=0.4)
+    lines1, labels1 = ax4a.get_legend_handles_labels()
+    lines2, labels2 = ax4b.get_legend_handles_labels()
+    ax4a.legend(lines1 + lines2, labels1 + labels2, fontsize=8)
+
+    plt.suptitle("REN Training v3 — VRFB SOC Estimator  (stateful BPTT)",
+                 fontsize=12, y=1.02)
     plt.tight_layout()
     fig_path = os.path.join(SAVE_DIR, "training_curves.png")
     plt.savefig(fig_path, dpi=150, bbox_inches="tight")
-    print(f"\n  Saved → {fig_path}")
-    print(f"  Saved → {SAVE_DIR}/ren_soc_best.pth")
-    print(f"  Saved → {SAVE_DIR}/ren_soc_last.pth")
-    print(f"  Saved → {SAVE_DIR}/training_log.csv")
+    print(f"\n  Saved -> {fig_path}")
+    print(f"  Saved -> {SAVE_DIR}/ren_soc_best.pth")
+    print(f"  Saved -> {SAVE_DIR}/ren_soc_last.pth")
+    print(f"  Saved -> {SAVE_DIR}/training_log.csv")
 
 
 if __name__ == "__main__":
