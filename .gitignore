@@ -3,3 +3,5 @@ datasets/
 *.csv
 *.pkl
 *.png
+__pycache__/
+*.pyc
