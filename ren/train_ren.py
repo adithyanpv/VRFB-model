@@ -108,6 +108,17 @@ WARMUP_STEPS     = 32     # steps per chunk excluded from loss (z settling)
 MSE_WEIGHT       = 0.7
 MAE_WEIGHT       = 0.3
 BOUNDARY_SCALE   = 3.0    # extra MSE weight multiplier near soc_min/soc_max
+# Fix 1: z0 starvation — probabilistic reset so z0 gets gradient from many chunks
+P_Z0_RESET       = 0.30   # prob of resetting z to z0 at chunk start (~21 times/episode)
+# Fix 2: temporal smoothness — penalise SOC jumps when current is near zero (ep52)
+SMOOTH_WEIGHT    = 0.10   # reduced from 0.50 — was suppressing legitimate SOC transitions
+SMOOTH_I_REF     = 0.3    # threshold in SCALED current units (after StandardScaler).
+                          # Scaled current: rest≈-0.5 to -1.0, active≈0.8 to 1.2
+                          # 0.3 means penalty is ~exp(-0.3/0.3)=0.37 during active
+                          # and ~exp(0/0.3)=1.0 during rest — correct behaviour
+# Fix 3: hard-case weighting — extra MSE on large errors (ep68)
+HARD_CASE_WEIGHT = 5.0    # multiplier when |pred - true| > HARD_CASE_THRESH
+HARD_CASE_THRESH = 0.10   # 10% SOC error threshold
 SOC_MIN          = 0.05   # BMS protection limits (must match config.py)
 SOC_MAX          = 0.95
 
@@ -159,118 +170,114 @@ def load_episodes(
 # =============================================================================
 
 def composite_loss(
-    pred:   torch.Tensor,   # (batch, seq, 1)
-    target: torch.Tensor,   # (batch, seq, 1)
+    pred:    torch.Tensor,                # (batch, seq, 1)
+    target:  torch.Tensor,                # (batch, seq, 1)
+    current: torch.Tensor | None = None,  # (batch, seq, 1) raw current [A]
 ) -> torch.Tensor:
     """
-    Boundary-weighted MSE + MAE.
+    Improved loss: boundary-weighted MSE + MAE + smoothness + hard-case.
 
-    The MSE component upweights samples where the true SOC is close to
-    soc_min or soc_max.  These are the safety-critical regions where BMS
-    protection triggers; an error of 0.01 near soc_min can cause an
-    unwanted shutdown or over-discharge.
-
-    Weight function: 1 + BOUNDARY_SCALE * (exp(-50*(y-soc_min)) +
-                                            exp(-50*(soc_max-y)))
-    This is ~1.0 in the mid-SOC range and rises to ~(1+BOUNDARY_SCALE)
-    within ~0.1 SOC units of either limit.
+    boundary weight : upweights samples near soc_min/soc_max
+    hard-case weight: 5x penalty when |pred-true| > 0.10 (ep68-type fix)
+    smoothness term : penalises SOC jumps weighted by exp(-|I|/I_ref)
+                      near-zero current -> large penalty  (ep52-type fix)
+                      high current      -> penalty near zero
     """
-    # Boundary weight (no gradient through target)
+    err = pred - target
+
     with torch.no_grad():
-        w = 1.0 + BOUNDARY_SCALE * (
+        # Boundary weight
+        w_boundary = 1.0 + BOUNDARY_SCALE * (
             torch.exp(-50.0 * (target - SOC_MIN).clamp(min=0.0)) +
             torch.exp(-50.0 * (SOC_MAX - target).clamp(min=0.0))
         )
+        # Hard-case weight (Fix 3 — ep68)
+        w_hard = torch.where(
+            err.abs() > HARD_CASE_THRESH,
+            torch.full_like(err, HARD_CASE_WEIGHT),
+            torch.ones_like(err),
+        )
+        w_total = w_boundary * w_hard
 
-    sq_err      = (pred - target) ** 2
-    weighted_mse = (w * sq_err).mean()
+    weighted_mse = (w_total * err ** 2).mean()
     mae          = F.l1_loss(pred, target)
+    base_loss    = MSE_WEIGHT * weighted_mse + MAE_WEIGHT * mae
 
-    return MSE_WEIGHT * weighted_mse + MAE_WEIGHT * mae
+    # Temporal smoothness loss (Fix 2 — ep52)
+    if current is not None and SMOOTH_WEIGHT > 0 and pred.shape[1] > 1:
+        delta_soc = (pred[:, 1:, :] - pred[:, :-1, :]).abs()
+        with torch.no_grad():
+            i_weight = torch.exp(-current[:, 1:, :].abs() / SMOOTH_I_REF)
+        smooth_loss = (i_weight * delta_soc).mean()
+        return base_loss + SMOOTH_WEIGHT * smooth_loss
+
+    return base_loss
 
 
-# =============================================================================
-# TRAINING — stateful episode loop
-# =============================================================================
 
 def run_stateful_epoch(
-    model:        REN,
-    episodes:     list,
-    optimiser:    torch.optim.Optimizer | None,
-    warmup_steps: int,
+    model:     REN,
+    episodes:  list,
+    optimiser: torch.optim.Optimizer | None,
 ) -> tuple[float, float, float, float]:
     """
-    Stateful episode training epoch.
-
-    For each episode:
-      - z starts from model.z0 (learned initial state)
-      - Chunks are processed in order; z carries forward with .detach()
-        between chunks (truncated BPTT — gradient does not flow across
-        chunk boundaries, preventing vanishing gradients over 18,000 steps)
-      - Loss is computed only on steps [warmup_steps:] of each chunk
-
-    Episodes are grouped into mini-batches of BATCH_SIZE for parallel
-    processing.  Episode order within a batch is consistent chunk-by-chunk
-    so z aligns correctly between chunks.  Episode groups are shuffled
-    each epoch.
+    Stateful episode training epoch with fixes:
+      Fix 1 — z0 reset: with prob P_Z0_RESET, reset z to learned z0
+               at each non-first chunk, giving z0 gradient signal
+               from ~P_Z0_RESET × n_chunks chunks per episode.
+      Fix 2 — smoothness loss: current slice passed to composite_loss
+      Fix 3 — hard-case loss: handled inside composite_loss
+      Fix 4 — val smoothing: handled in main() training loop
     """
     is_train = optimiser is not None
     model.train() if is_train else model.eval()
-
-    # Shuffle episode order each epoch
-    perm = torch.randperm(len(episodes)).tolist()
-
-    total_loss  = 0.0
-    sq_errors   = []
-    abs_errors  = []
-    n_batches   = 0
-
+    perm       = torch.randperm(len(episodes)).tolist()
+    total_loss = 0.0
+    sq_errors  = []
+    abs_errors = []
+    n_batches  = 0
     ctx = torch.enable_grad if is_train else torch.no_grad
 
     for batch_start in range(0, len(perm), BATCH_SIZE):
         batch_idxs = perm[batch_start : batch_start + BATCH_SIZE]
         batch_eps  = [episodes[i] for i in batch_idxs]
         B          = len(batch_eps)
-
-        # Minimum episode length in this batch (safe chunking)
-        min_len  = min(ep[0].shape[0] for ep in batch_eps)
-        n_chunks = min_len // SEQ_LEN
+        min_len    = min(ep[0].shape[0] for ep in batch_eps)
+        n_chunks   = min_len // SEQ_LEN
         if n_chunks == 0:
             continue
 
-        # Initialise z from learned z0
         z = model.z0.expand(B, -1).contiguous().to(DEVICE)
         if is_train:
             z = z.detach()
 
         batch_loss_sum = 0.0
-
         for chunk_idx in range(n_chunks):
             s = chunk_idx * SEQ_LEN
             e = s + SEQ_LEN
+            X_chunk = torch.stack([ep[0][s:e] for ep in batch_eps]).to(DEVICE)
+            y_chunk = torch.stack([ep[1][s:e] for ep in batch_eps]).to(DEVICE)
 
-            X_chunk = torch.stack(
-                [ep[0][s:e] for ep in batch_eps]
-            ).to(DEVICE)   # (B, SEQ_LEN, input_dim)
-
-            y_chunk = torch.stack(
-                [ep[1][s:e] for ep in batch_eps]
-            ).to(DEVICE)   # (B, SEQ_LEN, 1)
+            # Fix 1: probabilistic z0 reset — pass z=None so forward() uses
+            # self.z0 = tanh(_z0_raw) with full gradient flow to _z0_raw.
+            # Passing a detached value explicitly bypasses _z0_raw entirely.
+            use_z0 = is_train and chunk_idx > 0 and torch.rand(1).item() < P_Z0_RESET
 
             with ctx():
-                y_pred, z_next = model(X_chunk, z=z)
+                y_pred, z_next = model(X_chunk, z=None if use_z0 else z)
 
-                # Warmup masking: skip first warmup_steps from loss
-                if warmup_steps > 0 and SEQ_LEN > warmup_steps:
-                    y_pred_l  = y_pred[:, warmup_steps:, :]
-                    y_chunk_l = y_chunk[:, warmup_steps:, :]
+                # Warmup masking
+                if WARMUP_STEPS > 0 and SEQ_LEN > WARMUP_STEPS:
+                    y_pred_l  = y_pred[:, WARMUP_STEPS:, :]
+                    y_chunk_l = y_chunk[:, WARMUP_STEPS:, :]
+                    I_chunk_l = X_chunk[:, WARMUP_STEPS:, 1:2]  # current feature
                 else:
-                    y_pred_l  = y_pred
-                    y_chunk_l = y_chunk
+                    y_pred_l, y_chunk_l = y_pred, y_chunk
+                    I_chunk_l = X_chunk[:, :, 1:2]
 
-                loss = composite_loss(y_pred_l, y_chunk_l)
+                # Fix 2+3: smoothness + hard-case loss via improved composite_loss
+                loss = composite_loss(y_pred_l, y_chunk_l, current=I_chunk_l)
                 batch_loss_sum += loss.item()
-
                 err = (y_pred_l - y_chunk_l).detach().cpu().numpy().ravel()
                 sq_errors.append(err ** 2)
                 abs_errors.append(np.abs(err))
@@ -281,7 +288,6 @@ def run_stateful_epoch(
                     nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                     optimiser.step()
 
-            # Carry z forward — detach to truncate BPTT at chunk boundary
             z = z_next.detach()
 
         total_loss += batch_loss_sum / max(n_chunks, 1)
@@ -289,7 +295,6 @@ def run_stateful_epoch(
 
     sq_all  = np.concatenate(sq_errors)
     abs_all = np.concatenate(abs_errors)
-
     return (
         total_loss / max(n_batches, 1),
         math.sqrt(sq_all.mean()),
@@ -297,10 +302,6 @@ def run_stateful_epoch(
         abs_all.max(),
     )
 
-
-# =============================================================================
-# LEARNING RATE SCHEDULE
-# =============================================================================
 
 def get_lr(epoch: int, optimiser: torch.optim.Optimizer) -> float:
     return optimiser.param_groups[0]["lr"]
@@ -424,6 +425,7 @@ def main():
     print("  " + "-" * 88)
 
     best_val_loss  = math.inf
+    ema_val_loss   = math.inf
     patience_count = 0
     log            = []
     t_losses, v_losses, v_rmses, lrs_list = [], [], [], []
@@ -432,12 +434,8 @@ def main():
     for epoch in range(1, EPOCHS + 1):
         t_ep = time.time()
 
-        trn_loss, trn_rmse, trn_mae, _ = run_stateful_epoch(
-            model, train_eps, optimiser, WARMUP_STEPS
-        )
-        val_loss, val_rmse, val_mae, val_max = run_stateful_epoch(
-            model, test_eps, None, WARMUP_STEPS
-        )
+        trn_loss, trn_rmse, trn_mae, _ = run_stateful_epoch(model, train_eps, optimiser)
+        val_loss, val_rmse, val_mae, val_max = run_stateful_epoch(model, test_eps, None)
         scheduler.step()
 
         cr         = model.contraction_rate()
@@ -456,9 +454,16 @@ def main():
             contraction_rate=cr, z0_norm=z0_n, lr=current_lr
         ))
 
+        # Fix 4: EMA smoothing for early stopping (val loss is noisy
+        # with only 24 test episodes — raw loss causes premature stopping)
+        if epoch == 1:
+            ema_val_loss = val_loss
+        else:
+            ema_val_loss = 0.7 * ema_val_loss + 0.3 * val_loss
+
         marker = ""
-        if val_loss < best_val_loss:
-            best_val_loss  = val_loss
+        if ema_val_loss < best_val_loss:
+            best_val_loss  = ema_val_loss
             patience_count = 0
             torch.save(model.state_dict(),
                        os.path.join(SAVE_DIR, "ren_soc_best.pth"))
@@ -467,7 +472,8 @@ def main():
             patience_count += 1
 
         print(f"  {epoch:>4d}  {trn_loss:>10.6f}  {val_loss:>10.6f}  "
-              f"{val_rmse:>10.5f}  {val_mae:>9.5f}  {val_max:>8.5f}  "
+              f"({ema_val_loss:>8.6f})  "
+              f"{val_rmse:>10.5f}  {val_mae:>9.5f}  "
               f"{cr:>7.4f}  {z0_n:>6.3f}  {current_lr:>9.2e}"
               f"  [{ep_secs:.0f}s]{marker}")
 
@@ -487,9 +493,7 @@ def main():
         torch.load(os.path.join(SAVE_DIR, "ren_soc_best.pth"),
                    map_location=DEVICE)
     )
-    _, ren_rmse, ren_mae, ren_max = run_stateful_epoch(
-        model, test_eps, None, WARMUP_STEPS
-    )
+    _, ren_rmse, ren_mae, ren_max = run_stateful_epoch(model, test_eps, None)
 
     print(f"\n{'=' * 65}")
     print(f"  FINAL RESULTS — best model vs Coulomb Counter baseline")

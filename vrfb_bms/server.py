@@ -215,7 +215,7 @@ class SimulationEngine:
         )
 
         # ── 8. REN inference ──────────────────────────────────────────────
-        soc_ren  = self._ren_step(measured, soc_cc, out)
+        soc_ren  = self._ren_step(measured, out)
         soc_true = out["soc_true"]
 
         self.step_count += 1
