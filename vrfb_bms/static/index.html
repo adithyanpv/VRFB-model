@@ -23,6 +23,7 @@
   --red:       #ff3d5a;
   --yellow:    #ffd740;
   --purple:    #b388ff;
+  --pink:      #ff6ec7;
   --mono:      'Share Tech Mono', monospace;
   --sans:      'Barlow Condensed', sans-serif;
   --body:      'Barlow', sans-serif;
@@ -313,57 +314,6 @@ body::after {
   50%      { opacity: .4; }
 }
 .flashing { animation: flash .6s ease infinite; }
-
-/* ── MODE BADGE ── */
-.mode-badge {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 5px 10px; border-radius: 4px;
-  font-family: var(--mono); font-size: 12px; font-weight: 600;
-  letter-spacing: 2px; text-transform: uppercase;
-  transition: all .3s;
-}
-.mode-badge.charge    { background: rgba(0,229,255,0.12);  color: var(--cyan);   border: 1px solid rgba(0,229,255,0.3); }
-.mode-badge.discharge { background: rgba(0,255,157,0.12);  color: var(--green);  border: 1px solid rgba(0,255,157,0.3); }
-.mode-badge.standby   { background: rgba(90,122,154,0.15); color: var(--text-dim); border: 1px solid var(--border); }
-.mode-badge.startup   { background: rgba(255,215,64,0.12); color: var(--yellow); border: 1px solid rgba(255,215,64,0.3); }
-.mode-badge.shutdown  { background: rgba(255,61,90,0.18);  color: var(--red);    border: 1px solid rgba(255,61,90,0.4); }
-.mode-dot { width: 7px; height: 7px; border-radius: 50%; }
-.charge    .mode-dot { background: var(--cyan);    box-shadow: 0 0 6px var(--cyan); }
-.discharge .mode-dot { background: var(--green);   box-shadow: 0 0 6px var(--green); }
-.standby   .mode-dot { background: var(--text-dim); }
-.startup   .mode-dot { background: var(--yellow);  box-shadow: 0 0 6px var(--yellow); animation: blink .8s ease-in-out infinite; }
-.shutdown  .mode-dot { background: var(--red);     box-shadow: 0 0 8px var(--red); }
-@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
-
-/* ── STARTUP PROGRESS BAR ── */
-.startup-bar-wrap { height: 3px; background: var(--bg3); border-radius: 2px; margin-top: 6px; overflow: hidden; display: none; }
-.startup-bar-wrap.visible { display: block; }
-.startup-bar-fill { height: 100%; background: var(--yellow); border-radius: 2px; transition: width .4s ease; }
-
-/* ── HALF-CELL SOC PANEL ── */
-.halfcell-block { padding: 12px 16px; }
-.halfcell-row {
-  display: flex; align-items: center; justify-content: space-between;
-  margin-bottom: 8px;
-}
-.halfcell-label { font-family: var(--sans); font-size: 10px; letter-spacing: 2px; color: var(--text-dim); text-transform: uppercase; min-width: 36px; }
-.halfcell-bar-wrap { flex: 1; height: 8px; background: var(--bg3); border-radius: 4px; margin: 0 8px; overflow: hidden; position: relative; }
-.halfcell-bar { height: 100%; border-radius: 4px; transition: width .4s ease; }
-.halfcell-bar.neg { background: var(--cyan); }
-.halfcell-bar.pos { background: var(--purple); }
-.halfcell-val { font-family: var(--mono); font-size: 12px; min-width: 44px; text-align: right; }
-.imbalance-row {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 6px 8px; border-radius: 4px; margin-top: 4px;
-  background: var(--bg3); transition: background .3s;
-}
-.imbalance-row.warn { background: rgba(255,215,64,0.08); }
-.imbalance-row.crit { background: rgba(255,61,90,0.12); }
-.imbalance-label { font-family: var(--sans); font-size: 10px; letter-spacing: 2px; color: var(--text-dim); text-transform: uppercase; }
-.imbalance-val { font-family: var(--mono); font-size: 14px; }
-.imbalance-val.ok   { color: var(--green); }
-.imbalance-val.warn { color: var(--yellow); }
-.imbalance-val.crit { color: var(--red); }
 </style>
 </head>
 <body>
@@ -415,48 +365,6 @@ body::after {
       </div>
     </div>
 
-      <!-- MODE STATE MACHINE -->
-      <div class="panel" style="padding:12px 16px;">
-        <div class="panel-label">OPERATIONAL MODE</div>
-        <div id="modeBadge" class="mode-badge standby">
-          <div class="mode-dot"></div>
-          <span id="modeText">STANDBY</span>
-        </div>
-        <div class="startup-bar-wrap" id="startupBarWrap">
-          <div class="startup-bar-fill" id="startupBarFill" style="width:0%"></div>
-        </div>
-        <div style="margin-top:8px; display:flex; gap:16px;">
-          <div>
-            <div class="metric-name">STANDBY TIMER</div>
-            <div style="font-family:var(--mono);font-size:14px;color:var(--text-dim);" id="standbyTimer">—</div>
-          </div>
-          <div>
-            <div class="metric-name">DRAIN</div>
-            <div style="font-family:var(--mono);font-size:14px;" id="drainStatus">OFF</div>
-          </div>
-        </div>
-      </div>
-      <!-- HALF-CELL SOC -->
-      <div class="panel halfcell-block">
-        <div class="panel-label">HALF-CELL SOC</div>
-        <div class="halfcell-row">
-          <div class="halfcell-label">NEG</div>
-          <div class="halfcell-bar-wrap"><div class="halfcell-bar neg" id="barNeg" style="width:50%"></div></div>
-          <div class="halfcell-val" id="valNeg" style="color:var(--cyan)">50.0%</div>
-        </div>
-        <div class="halfcell-row">
-          <div class="halfcell-label">POS</div>
-          <div class="halfcell-bar-wrap"><div class="halfcell-bar pos" id="barPos" style="width:50%"></div></div>
-          <div class="halfcell-val" id="valPos" style="color:var(--purple)">50.0%</div>
-        </div>
-        <div class="imbalance-row" id="imbalanceRow">
-          <div class="imbalance-label">IMBALANCE</div>
-          <div class="imbalance-val ok" id="imbalanceVal">0.0%</div>
-        </div>
-        <div style="margin-top:6px; font-family:var(--mono); font-size:10px; color:var(--text-mute);">
-          SYSTEM SOC&nbsp;<span id="socSystem" style="color:var(--text-dim)">—</span>
-        </div>
-      </div>
     <!-- BMS LAYERS -->
     <div class="panel bms-layers">
       <div class="panel-label">BMS PROTECTION LAYERS</div>
@@ -616,8 +524,12 @@ body::after {
       <div class="stat-val" id="statSteps" style="color:var(--text-dim)">—</div>
     </div>
     <div class="stat-cell">
-      <div class="stat-name">REN MAE (session)</div>
+      <div class="stat-name">REN STANDALONE MAE</div>
       <div class="stat-val" id="statRenMae" style="color:var(--green)">—</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-name">REN HYBRID MAE</div>
+      <div class="stat-val" id="statRenHybridMae" style="color:var(--purple)">—</div>
     </div>
     <div class="stat-cell">
       <div class="stat-name">CC MAE (session)</div>
@@ -684,6 +596,7 @@ const socChart = new Chart(socCtx, {
       { label: 'Ground Truth',   data: [], borderColor: '#00e5ff', borderWidth: 2,   pointRadius: 0, tension: 0.1 },
       { label: 'REN Estimate',   data: [], borderColor: '#00ff9d', borderWidth: 1.5, pointRadius: 0, tension: 0.1, borderDash: [] },
       { label: 'Coulomb Counter',data: [], borderColor: '#ff8c42', borderWidth: 1.5, pointRadius: 0, tension: 0.1, borderDash: [4,3] },
+      { label: 'REN Hybrid',     data: [], borderColor: '#b388ff', borderWidth: 1.5, pointRadius: 0, tension: 0.1 },
     ]
   },
   options: { ...chartDefaults, scales: { ...chartDefaults.scales, y: { ...chartDefaults.scales.y, min: 0, max: 1 } } }
@@ -703,7 +616,7 @@ const errChart = new Chart(errCtx, {
   options: { ...chartDefaults, scales: { ...chartDefaults.scales, y: { ...chartDefaults.scales.y, min: 0 } } }
 });
 
-function pushChart(t, soc_true, soc_cc, soc_ren, err_cc, err_ren) {
+function pushChart(t, soc_true, soc_cc, soc_ren, soc_ren_hybrid, err_cc, err_ren, err_ren_hybrid) {
   const lbl = `T+${t}s`;
   [socChart, errChart].forEach(c => {
     c.data.labels.push(lbl);
@@ -713,6 +626,7 @@ function pushChart(t, soc_true, soc_cc, soc_ren, err_cc, err_ren) {
   socD[0].data.push(soc_true); if (socD[0].data.length > MAX_POINTS) socD[0].data.shift();
   socD[1].data.push(soc_ren);  if (socD[1].data.length > MAX_POINTS) socD[1].data.shift();
   socD[2].data.push(soc_cc);   if (socD[2].data.length > MAX_POINTS) socD[2].data.shift();
+  socD[3].data.push(soc_ren_hybrid); if (socD[3].data.length > MAX_POINTS) socD[3].data.shift();
 
   const errD = errChart.data.datasets;
   errD[0].data.push(err_ren); if (errD[0].data.length > MAX_POINTS) errD[0].data.shift();
@@ -727,7 +641,7 @@ function loadHistory(history) {
 }
 
 // ── WebSocket ──────────────────────────────────────────────────────────────
-let ws, sessionErrRen = [], sessionErrCC = [];
+let ws, sessionErrRen = [], sessionErrCC = [], sessionErrRenHybrid = [];
 
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`);
@@ -807,54 +721,8 @@ function updateDash(d) {
   // Capacity
   document.getElementById('mCap').innerHTML = `${d.capacity_ah.toFixed(0)}<span class="metric-unit">Ah</span>`;
 
-  // BMS — mode state machine
+  // BMS
   const f = d.bms_flags;
-
-  const modeKey = d.bms_mode || 'standby';
-  const badge   = document.getElementById('modeBadge');
-  badge.className = 'mode-badge ' + modeKey;
-  document.getElementById('modeText').textContent = modeKey.toUpperCase();
-
-  // Startup progress bar
-  const startupWrap = document.getElementById('startupBarWrap');
-  const startupFill = document.getElementById('startupBarFill');
-  if (modeKey === 'startup') {
-    startupWrap.classList.add('visible');
-    startupFill.style.width = (d.bms_startup_pct || 0) + '%';
-  } else {
-    startupWrap.classList.remove('visible');
-  }
-
-  // Standby timer
-  const st = d.bms_standby_timer_s || 0;
-  const stMin = Math.floor(st / 60), stSec = Math.floor(st % 60);
-  document.getElementById('standbyTimer').textContent =
-    modeKey === 'standby' ? `${stMin}m ${stSec}s` : '—';
-
-  // Drain indicator
-  const drainEl = document.getElementById('drainStatus');
-  drainEl.textContent = d.bms_drain_active ? 'ACTIVE' : 'OFF';
-  drainEl.style.color = d.bms_drain_active ? 'var(--yellow)' : 'var(--text-mute)';
-
-  // Half-cell SOC
-  const socNegPct = ((d.soc_neg || 0) * 100).toFixed(2);
-  const socPosPct = ((d.soc_pos || 0) * 100).toFixed(2);
-  document.getElementById('valNeg').textContent = socNegPct + '%';
-  document.getElementById('valPos').textContent = socPosPct + '%';
-  document.getElementById('barNeg').style.width = socNegPct + '%';
-  document.getElementById('barPos').style.width = socPosPct + '%';
-  document.getElementById('socSystem').textContent =
-    ((d.soc_system || 0) * 100).toFixed(2) + '%';
-
-  // Imbalance
-  const imb      = (d.soc_imbalance || 0) * 100;
-  const imbEl    = document.getElementById('imbalanceVal');
-  const imbRow   = document.getElementById('imbalanceRow');
-  imbEl.textContent = imb.toFixed(2) + '%';
-  imbRow.className  = 'imbalance-row' + (imb > 10 ? ' crit' : imb > 5 ? ' warn' : '');
-  imbEl.className   = 'imbalance-val' + (imb > 10 ? ' crit' : imb > 5 ? ' warn' : ' ok');
-
-  // Protection layers
   function setLayer(id, active, derate) {
     const el = document.getElementById(id);
     el.classList.remove('active', 'derate');
@@ -881,6 +749,7 @@ function updateDash(d) {
   document.getElementById('headerTime').textContent = `SIM ${sim_min}m${sim_sec}s | REAL ${real_s}s`;
 
   sessionErrRen.push(d.err_ren);
+  sessionErrRenHybrid.push(d.err_ren_hybrid || 0);
   sessionErrCC.push(d.err_cc);
   if (sessionErrRen.length > 3000) { sessionErrRen.shift(); sessionErrCC.shift(); }
 
@@ -894,11 +763,16 @@ function updateDash(d) {
   document.getElementById('statCcMae').textContent  = mae_cc;
   document.getElementById('statImprove').textContent = impr;
 
+  const mae_ren_hybrid = (sessionErrRenHybrid.reduce((a,b)=>a+b,0)/Math.max(sessionErrRenHybrid.length,1)*100).toFixed(3) + '%';
+  if (document.getElementById('statRenHybridMae')) {
+    document.getElementById('statRenHybridMae').textContent = mae_ren_hybrid;
+  }
+
   const nActive = Object.values(f).filter(Boolean).length;
   document.getElementById('statBms').textContent = nActive;
   document.getElementById('statBms').style.color = nActive > 0 ? 'var(--red)' : 'var(--green)';
 
-  pushChart(d.t, d.soc_true, d.soc_cc, d.soc_ren, d.err_cc, d.err_ren);
+  pushChart(d.t, d.soc_true, d.soc_cc, d.soc_ren, d.soc_ren_hybrid||0, d.err_cc, d.err_ren, d.err_ren_hybrid||0);
 }
 
 // ── Controls ───────────────────────────────────────────────────────────────
@@ -929,7 +803,7 @@ function setPreset(v) {
 }
 
 function resetSim() {
-  sessionErrRen = []; sessionErrCC = [];
+  sessionErrRen = []; sessionErrCC = []; sessionErrRenHybrid = [];
   [socChart, errChart].forEach(c => {
     c.data.labels = [];
     c.data.datasets.forEach(d => d.data = []);

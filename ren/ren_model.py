@@ -56,15 +56,17 @@ class REN(nn.Module):
         output_dim:    int   = 1,
         alpha:         float = 0.5,
         dropout:       float = 0.1,
-        n_power_iters: int   = 10,
+        n_power_iters:   int   = 10,
+        use_feedthrough: bool  = False,  # False = all SOC info through z (recommended)
     ):
         super().__init__()
         assert 0.0 < alpha < 1.0, "alpha must be strictly in (0, 1)"
 
-        self.hidden_dim    = hidden_dim
-        self.output_dim    = output_dim
-        self.alpha         = alpha
-        self.n_power_iters = n_power_iters
+        self.hidden_dim     = hidden_dim
+        self.output_dim     = output_dim
+        self.alpha          = alpha
+        self.n_power_iters  = n_power_iters
+        self.use_feedthrough = use_feedthrough
 
         # Free (unconstrained) weight — projected to A_bar at runtime
         self.A_free  = nn.Parameter(torch.empty(hidden_dim, hidden_dim))
@@ -174,7 +176,13 @@ class REN(nn.Module):
         pre    = z @ A_bar.t() + self.B(x_t) + self.b_z
         z_next = torch.tanh(self.ln_z(pre))
         z_next = self.drop(z_next)
-        y_t    = self.C(z_next) + self.D(x_t)
+        # use_feedthrough=False: D(x_t) removed from output.
+        # Flow/voltage noise no longer reaches SOC directly.
+        # Only D.bias kept — a learnable scalar output offset.
+        if self.use_feedthrough:
+            y_t = self.C(z_next) + self.D(x_t)
+        else:
+            y_t = self.C(z_next) + self.D.bias
         return y_t, z_next
 
     # ------------------------------------------------------------------

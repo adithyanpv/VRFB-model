@@ -35,51 +35,45 @@ from ren.ren_model        import REN
 
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR  = os.path.join(BASE_DIR, "static")
-SCALER_PATH = os.path.join(os.path.dirname(BASE_DIR), "ren", "scaler.pkl")
-MODEL_PATH  = os.path.join(os.path.dirname(BASE_DIR), "ren", "ren_soc_best.pth")
+# Paths resolved relative to project root at runtime
 
 HIDDEN_DIM  = 128
-ALPHA       = 0.5    # match train_ren.py v3
+ALPHA       = 0.5
+STANDALONE_DIR = 'ren/standalone'
+HYBRID_DIR     = 'ren/hybrid'
 DEVICE      = torch.device("cpu")
 SIM_HZ         = 1.0    # WebSocket broadcast frequency (Hz)
 STEPS_PER_TICK = 10     # Sim steps per broadcast — 10× realtime speed
 HISTORY_LEN    = 300
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONNECTION MANAGER (WEBSOCKETS)
+# ═══════════════════════════════════════════════════════════════════════════════
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
 
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        # Convert message to JSON string once
+        msg_str = json.dumps(message)
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(msg_str)
+            except Exception:
+                pass
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONNECTION MANAGER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class ConnectionManager:
-    def __init__(self):
-        self.active: list[WebSocket] = []
-
-    async def connect(self, ws: WebSocket):
-        await ws.accept()
-        self.active.append(ws)
-
-    def disconnect(self, ws: WebSocket):
-        if ws in self.active:
-            self.active.remove(ws)
-
-    async def broadcast(self, data: dict):
-        msg  = json.dumps(data)
-        dead = []
-        for ws in self.active:
-            try:
-                await ws.send_text(msg)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(ws)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SIMULATION ENGINE
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class SimulationEngine:
-
     def __init__(self):
         self.cfg     = VRFBConfig()
         self.battery = VRFB(self.cfg)
@@ -88,34 +82,41 @@ class SimulationEngine:
         self.cc      = CoulombCounter(self.cfg)
         self.cc.initialize(self.cfg.initial_soc)
 
-        # REN model
-        self.model = REN(
-            input_dim     = 5,          # V, I, T_stack, T_tank, Q
-            hidden_dim    = HIDDEN_DIM,
-            output_dim    = 1,
-            alpha         = 0.5,        # match train_ren.py v3
-            dropout       = 0.1,        # keep > 0 for MC uncertainty
-            n_power_iters = 10,
-        ).to(DEVICE)
-        self.model.load_state_dict(
-            torch.load(MODEL_PATH, map_location=DEVICE)
-        )
-        self.model.eval()
+        proj_root = os.path.dirname(BASE_DIR)
 
-        with open(SCALER_PATH, "rb") as f:
-            self.scaler = pickle.load(f)
+        def _load_model(subdir, input_dim):
+            model = REN(
+                input_dim=input_dim, hidden_dim=HIDDEN_DIM,
+                output_dim=1, alpha=ALPHA, dropout=0.1,
+                n_power_iters=10, use_feedthrough=False,
+            ).to(DEVICE)
+            model.load_state_dict(torch.load(
+                os.path.join(proj_root, subdir, "ren_soc_best.pth"),
+                map_location=DEVICE))
+            model.eval()
+            with open(os.path.join(proj_root, subdir, "scaler.pkl"), "rb") as f:
+                scaler = pickle.load(f)
+            return model, scaler
 
-        self.z_ren      = torch.zeros(1, HIDDEN_DIM, device=DEVICE)
-        self.I_cmd      = 0.0          # operator-commanded current (A)
-        self.Q_cmd      = self.cfg.initial_flow   # operator-commanded flow (m³/s)
+        self.model_sa,  self.scaler_sa  = _load_model(STANDALONE_DIR, 5)
+        self.model_hy,  self.scaler_hy  = _load_model(HYBRID_DIR,     8)
+
+        self.z_sa   = torch.zeros(1, HIDDEN_DIM, device=DEVICE)
+        self.z_hy   = torch.zeros(1, HIDDEN_DIM, device=DEVICE)
+        self.soc_sa_ema = None
+        self.soc_hy_ema = None
+
+        # I_limit approximation constants (mirrors dataset_gen.py)
+        self._il_const = 1 * 96485.0 * 2e-5 * 0.15 * 1600.0 * 0.5
+        self._q_ref    = 20.0 / 60000.0
+
+        self.I_cmd      = 0.0
+        self.Q_cmd      = self.cfg.initial_flow
         self.T_amb      = self.cfg.initial_temperature
         self.history    = []
         self.step_count = 0
         self.t_start    = time.time()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # BMS FLAGS  (for dashboard layer indicators)
-    # ─────────────────────────────────────────────────────────────────────────
 
     def _bms_flags(self, out: dict, I_cmd: float, I_safe: float) -> dict:
         cfg  = self.cfg
@@ -163,27 +164,43 @@ class SimulationEngine:
     # REN INFERENCE
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _ren_step(self, measured: dict, out: dict) -> float:
-        """
-        REN inference step using only physically measurable sensor signals.
-        No Coulomb counter output, no derived concentrations.
-        """
+    def _approx_i_limit(self, Q_m3s):
+        return self._il_const * (max(Q_m3s, 1e-6) / self._q_ref) ** 0.4
+
+    def _ren_step_standalone(self, measured, out):
+        """5 raw sensor features — no CC, no derived."""
         x = np.array([[
-            measured["voltage"],             # stack voltage [V]
-            measured["current"],             # current [A]
-            measured["temperature"],         # stack thermocouple [K]
-            measured["temperature_tank"],    # tank thermocouple [K]
-            measured["flow_rate"],           # flow meter [m3/s]
+            measured["voltage"],
+            measured["current"],
+            measured["temperature"],
+            measured["temperature_tank"],
+            measured["flow_rate"],
         ]], dtype=np.float32)
-        x_s = self.scaler.transform(x).astype(np.float32)
+        x_s = self.scaler_sa.transform(x).astype(np.float32)
         x_t = torch.tensor(x_s).unsqueeze(0).to(DEVICE)
         with torch.no_grad():
-            y_seq, self.z_ren = self.model(x_t, z=self.z_ren)
+            y_seq, self.z_sa = self.model_sa(x_t, z=self.z_sa)
         return float(y_seq.squeeze())
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # SINGLE SIMULATION STEP
-    # ─────────────────────────────────────────────────────────────────────────
+    def _ren_step_hybrid(self, measured, soc_cc, out):
+        """8 features: 5 sensors + CC + approx hydraulics."""
+        il   = self._approx_i_limit(measured["flow_rate"])
+        tr   = abs(measured["current"]) / max(il, 1.0)
+        x = np.array([[
+            measured["voltage"],
+            measured["current"],
+            measured["temperature"],
+            measured["temperature_tank"],
+            measured["flow_rate"],
+            float(soc_cc),
+            il,
+            tr,
+        ]], dtype=np.float32)
+        x_s = self.scaler_hy.transform(x).astype(np.float32)
+        x_t = torch.tensor(x_s).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            y_seq, self.z_hy = self.model_hy(x_t, z=self.z_hy)
+        return float(y_seq.squeeze())
 
     def step(self) -> dict:
         dt  = self.cfg.dt_default
@@ -215,7 +232,20 @@ class SimulationEngine:
         )
 
         # ── 8. REN inference ──────────────────────────────────────────────
-        soc_ren  = self._ren_step(measured, out)
+        # ── 8. REN inference — both models ───────────────────────────────
+        EMA_A = 1.0 / 30.0
+
+        raw_sa = self._ren_step_standalone(measured, out)
+        self.soc_sa_ema = (raw_sa if self.soc_sa_ema is None
+                           else (1-EMA_A)*self.soc_sa_ema + EMA_A*raw_sa)
+        soc_ren_sa = self.soc_sa_ema
+
+        raw_hy = self._ren_step_hybrid(measured, soc_cc, out)
+        self.soc_hy_ema = (raw_hy if self.soc_hy_ema is None
+                           else (1-EMA_A)*self.soc_hy_ema + EMA_A*raw_hy)
+        soc_ren_hy = self.soc_hy_ema
+
+        soc_ren  = soc_ren_sa   # backward compat alias
         soc_true = out["soc_true"]
 
         self.step_count += 1
@@ -235,9 +265,11 @@ class SimulationEngine:
             # ── SOC — estimators ──────────────────────────────────────────
             "soc_true"       : round(soc_true, 5),
             "soc_cc"         : round(float(soc_cc), 5),
-            "soc_ren"        : round(soc_ren, 5),
+            "soc_ren"        : round(soc_ren_sa, 5),
+            "soc_ren_hybrid" : round(soc_ren_hy, 5),
             "err_cc"         : round(abs(float(soc_cc) - soc_true), 5),
-            "err_ren"        : round(abs(soc_ren - soc_true), 5),
+            "err_ren"        : round(abs(soc_ren_sa - soc_true), 5),
+            "err_ren_hybrid" : round(abs(soc_ren_hy - soc_true), 5),
             # ── SOC — half-cell breakdown ─────────────────────────────────
             "soc_neg"        : round(out["soc_neg"],       5),
             "soc_pos"        : round(out["soc_pos"],       5),
@@ -272,8 +304,8 @@ class SimulationEngine:
         # Trim history to last HISTORY_LEN steps
         self.history.append({
             k: snap[k] for k in [
-                "t", "soc_true", "soc_cc", "soc_ren",
-                "voltage", "current", "err_cc", "err_ren",
+                "t", "soc_true", "soc_cc", "soc_ren", "soc_ren_hybrid",
+                "voltage", "current", "err_cc", "err_ren", "err_ren_hybrid",
                 "soc_neg", "soc_pos", "soc_imbalance",
             ]
         })

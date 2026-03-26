@@ -95,10 +95,24 @@ FEATURE_COLS = [
 TARGET_COL = "SOC_true"
 
 # Column order in the row buffer
-# soc_cc saved in CSV for fusion model training.
-# It is NOT in FEATURE_COLS (which defines the standalone model).
-EXTRA_COLS = ["soc_cc"]
+# Extra columns saved for hybrid model training.
+# NOT in FEATURE_COLS (standalone uses only 5 physical sensors).
+# I_limit_approx and transport_ratio_approx are derived from
+# measurable Q and I — no extra hardware required.
+EXTRA_COLS = ["soc_cc", "I_limit_approx", "transport_ratio_approx"]
 ROW_COLS = ["episode_id", "time"] + FEATURE_COLS + EXTRA_COLS + [TARGET_COL]
+
+# I_limit approximation constants (from config.py)
+_IL_CONST = 1 * 96485.0 * 2e-5 * 0.15 * 1600.0 * 0.5  # 231.6 A at Q_ref
+_Q_REF    = 20.0 / 60000.0  # 20 LPM in m³/s
+
+def approx_i_limit(Q_m3s: float) -> float:
+    """I_limit from flow rate alone (fixed mid-SOC concentration)."""
+    return _IL_CONST * (max(Q_m3s, 1e-6) / _Q_REF) ** 0.4
+
+def approx_transport_ratio(I_A: float, Q_m3s: float) -> float:
+    """Fraction of limiting current being drawn."""
+    return abs(I_A) / max(approx_i_limit(Q_m3s), 1.0)
 N_COLS   = len(ROW_COLS)
 
 # SOC bands for stratification — 9 bands × ~13 episodes each
@@ -417,8 +431,12 @@ for ep in tqdm(range(N_EPISODES), desc="Generating episodes"):
         ep_data[step, IDX["temperature_stack"]] = measured["temperature"]
         ep_data[step, IDX["temperature_tank"]]  = measured["temperature_tank"]
         ep_data[step, IDX["flow_rate"]]         = measured["flow_rate"]
-        ep_data[step, IDX["soc_cc"]]            = float(soc_cc)
-        ep_data[step, IDX["SOC_true"]]          = out["soc_true"]
+        ep_data[step, IDX["soc_cc"]]                     = float(soc_cc)
+        _il   = approx_i_limit(measured["flow_rate"])
+        _tr   = approx_transport_ratio(measured["current"], measured["flow_rate"])
+        ep_data[step, IDX["I_limit_approx"]]             = _il
+        ep_data[step, IDX["transport_ratio_approx"]]     = _tr
+        ep_data[step, IDX["SOC_true"]]                   = out["soc_true"]
 
     all_chunks.append(ep_data)
 
