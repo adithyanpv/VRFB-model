@@ -188,15 +188,17 @@ class SimulationEngine:
 
     def _ren_step(self, measured: dict, soc_cc: float) -> float:
         """
-        7-feature hybrid inference: 5 sensors + CC SOC + transport_ratio_approx.
-        I_limit_approx removed — changed with Q at I=0, violating dSOC/dt=0.
-        transport_ratio_approx = |I|/I_limit = 0 at I=0 (physically correct).
+        7-feature hybrid inference: 5 sensors + soc_cc + transport_ratio_approx.
+ 
+        GATE FIX: raw current (Amps) passed as x_raw so gate closes at I=0A.
+        Previously no x_raw was passed — gate used scaled current and never
+        closed at zero current (gate ≈ 0.44 instead of 0.0 at I=0A).
         """
         Q  = measured["flow_rate"]
-        I  = measured["current"]
+        I  = measured["current"]                           # raw Amps
         il = self._il_const * (max(Q, 1e-6) / self._q_ref) ** 0.4
-        tr = abs(I) / max(il, 1.0)   # 0 when I = 0
-
+        tr = abs(I) / max(il, 1.0)                        # 0 when I = 0
+ 
         x = np.array([[
             measured["voltage"],
             I,
@@ -206,16 +208,19 @@ class SimulationEngine:
             float(soc_cc),
             tr,
         ]], dtype=np.float32)
-
+ 
         x_s = self.scaler.transform(x).astype(np.float32)
         x_t = torch.tensor(x_s).unsqueeze(0).to(DEVICE)
+ 
+        # Raw current as (1, 1, 1) tensor in Amps — gate uses this, not scaled value
+        I_raw = torch.tensor([[[I]]], dtype=torch.float32).to(DEVICE)
+ 
         with torch.no_grad():
-            y_seq, self.z_ren = self.model(x_t, z=self.z_ren)
+            y_seq, self.z_ren = self.model(x_t, z=self.z_ren, x_raw=I_raw)
+ 
         correction = float(y_seq.squeeze())
-        soc_ren = soc_cc + correction
-        soc_ren = max(0.0, min(1.0, soc_ren))
+        soc_ren    = float(np.clip(soc_cc + correction, 0.0, 1.0))
         return soc_ren
-
     # ─────────────────────────────────────────────────────────────────────────
     # SINGLE SIMULATION STEP
     # ─────────────────────────────────────────────────────────────────────────
