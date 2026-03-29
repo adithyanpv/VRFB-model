@@ -1,24 +1,18 @@
 CC + REN Hybrid vs Coulomb Counter — Test Set Summary
 ========================================================
-Test episodes    : 24
-Total rows       : 432,000
-Gate @ I=0A      : 0.5150  (target < 0.1)
+Gate @ I=0A (raw Amps)      : 0.000000  (must be 0.0)
+Corr(CC_error, correction)  : -0.6168  (target: -1.0)
 
-Metric                   CC+REN          CC    Improvement
+Metric                     CC+REN          CC   Improvement
 ----------------------------------------------------------
-RMSE                    0.10116     0.14172         +28.6%
-MAE                     0.07914     0.11637         +32.0%
-Max Error               0.32363     0.33851          +4.4%
-Mean Bias              -0.00264    -0.06438              —
+RMSE                      0.09929     0.14172        +29.9%
+MAE                       0.07667     0.11637        +34.1%
+Max Error                 0.32360     0.33851         +4.4%
+Mean Bias                -0.00247    -0.06438             —
 
-Episodes improved (RMSE) : 16/24 (67%)
-Steps with lower error   : 66.5%
-Corr(correction, CC err) : -0.5989
+Episodes improved (RMSE): 16/24
+Steps improved: 66.9%
 
-Per-episode RMSE stats:
-  CC+REN  mean=0.08549  min=0.01052  max=0.24318
-  CC      mean=0.11646  min=0.00430  max=0.33350
-
-VERDICT: CC + REN HYBRID IS BETTER
-RMSE improvement: +28.62%
-MAE  improvement: +31.99%
+VERDICT : CC + REN IS BETTER
+RMSE improvement : +29.94%
+MAE  improvement : +34.11%
