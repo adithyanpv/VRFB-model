@@ -1,5 +1,5 @@
 """
-REN Training Script — VRFB SOC Estimator (CC + REN hybrid)
+REN Training Script — VRFB SOC Estimator (CC + REN hybrid) 1.6
 ============================================================
 
 Features (7):
