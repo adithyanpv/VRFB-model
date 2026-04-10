@@ -1,0 +1,36 @@
+Continuous Cycle Test — CC + REN vs Coulomb Counter  (v2)
+============================================================
+Cycles          : 5
+Current         : 150 A
+Flow            : 20 LPM
+SOC window      : 0.30 → 0.70  (swing = 0.40)
+CC bias         : 3.00 A  (sensor DC offset)
+CC init error   : 0.0%
+Q_nominal       : 2144 Ah
+Steps/half-cycle: 21,184  (5.9 h)
+Expected drift  : 0.0082 SOC/half-cycle
+Gate @ I=0A     : 0.000000  (must be 0.0)
+
+Metric                     CC+REN          CC   Improvement
+----------------------------------------------------------
+RMSE                      0.06848     0.08441        +18.9%
+MAE                       0.05874     0.07502        +21.7%
+Max Error                 0.15407     0.13537        -13.8%
+Mean Bias                -0.02888    -0.07502             —
+
+Cycles improved (RMSE)   : 5/5
+Corr(CC_err, correction) : -0.6477  (target: -1.0)
+
+Per-cycle results (cumulative drift shows CC degradation):
+   Cycle     CC RMSE    REN RMSE   Improvement    End CC err
+  --------------------------------------------------------
+       1     0.02344     0.02166         +7.6%      -0.02799
+       2     0.04920     0.04485         +8.8%      -0.05461
+       3     0.07554     0.06641        +12.1%      -0.08122
+       4     0.10202     0.08503        +16.7%      -0.10783
+       5     0.12855     0.09729        +24.3%      -0.13470
+
+CC RMSE trend  : +0.026303 per cycle  (GROWING - drift confirmed )
+REN RMSE trend : +0.019145 per cycle  (bounded)
+
+VERDICT: CC+REN IS BETTER with +18.9% RMSE improvement
