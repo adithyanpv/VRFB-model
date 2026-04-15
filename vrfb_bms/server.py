@@ -42,7 +42,8 @@ DEVICE         = torch.device("cpu")
 SIM_HZ         = 1.0
 STEPS_PER_TICK = 10
 HISTORY_LEN    = 300
-EMA_TAU        = 30
+EMA_TAU_FAST = 30     # used for BMS protection decisions (responsive)
+EMA_TAU_DISP = 120    # used for dashboard display (smooth visual)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -145,7 +146,8 @@ class SimulationEngine:
         """Reset REN hidden state and EMA — use learned z0, not zeros."""
         with torch.no_grad():
             self.z_ren = self.model.z0.detach().clone()
-        self.soc_ren_ema = self.cfg.initial_soc
+        self.soc_ren_ema_fast = self.cfg.initial_soc   # for BMS
+        self.soc_ren_ema_disp = self.cfg.initial_soc   # for display
 
     # ─────────────────────────────────────────────────────────────────────────
     # BMS FLAGS
