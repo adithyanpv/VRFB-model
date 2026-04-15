@@ -1,6 +1,6 @@
 # vrfb_bms/server.py
 """
-VRFB Battery Management System — Real-Time Web Server
+VRFB Battery Management System — Real-Time Web Server 1.7
 ======================================================
 FastAPI + WebSocket server that runs the VRFB digital twin at 1 Hz,
 applies the 7-layer BMS with operational mode state machine,
