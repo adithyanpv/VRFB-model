@@ -77,7 +77,7 @@ os.makedirs("datasets", exist_ok=True)
 # =============================================================================
 
 N_EPISODES    = 120
-EPISODE_STEPS = 18000     # 5 hours at dt=1s
+EPISODE_STEPS = 36000     # 10 hours at dt=1s  (covers live demo duration)
 TRAIN_FRAC    = 0.80      # 96 train / 24 test
 SEED          = 42
 rng           = np.random.default_rng(SEED)
@@ -99,7 +99,7 @@ TARGET_COL = "SOC_true"
 # NOT in FEATURE_COLS (standalone uses only 5 physical sensors).
 # I_limit_approx and transport_ratio_approx are derived from
 # measurable Q and I — no extra hardware required.
-EXTRA_COLS = ["soc_cc", "I_limit_approx", "transport_ratio_approx"]
+EXTRA_COLS = ["soc_cc", "I_limit_approx", "transport_ratio_approx","elapsed_time_norm"]
 ROW_COLS = ["episode_id", "time"] + FEATURE_COLS + EXTRA_COLS + [TARGET_COL]
 
 # I_limit approximation constants (from config.py)
@@ -313,7 +313,10 @@ for ep in tqdm(range(N_EPISODES), desc="Generating episodes"):
 
     current_type = rng.choice(current_pool)
     flow_type    = rng.choice(FLOW_PROFILES)
-    T_base       = rng.uniform(293.0, 318.0)
+    if rng.random() < 0.20:
+        T_base = rng.uniform(308.0, 322.0)   # hot operating regime
+    else:
+        T_base = rng.uniform(296.0, 303.0)   # normal start temperature
 
     # ── CC initial SOC error (Option A) ──────────────────────────────────
     # Base: uniform ±0.15.  20% chance of a harder outlier in ±[0.15, 0.25].
@@ -418,7 +421,7 @@ for ep in tqdm(range(N_EPISODES), desc="Generating episodes"):
         measured = sensor.measure(out)
 
         soc_cc = cc.update(
-            measured_current = measured["current"] + current_bias,
+            measured_current = measured["current"],
             dt               = dt,
             Q_nominal        = out["capacity_nominal"],
         )
@@ -432,6 +435,7 @@ for ep in tqdm(range(N_EPISODES), desc="Generating episodes"):
         ep_data[step, IDX["temperature_tank"]]  = measured["temperature_tank"]
         ep_data[step, IDX["flow_rate"]]         = measured["flow_rate"]
         ep_data[step, IDX["soc_cc"]]                     = float(soc_cc)
+        ep_data[step, IDX["elapsed_time_norm"]] = step / EPISODE_STEPS  # 0→1 over episode
         _il   = approx_i_limit(measured["flow_rate"])
         _tr   = approx_transport_ratio(measured["current"], measured["flow_rate"])
         ep_data[step, IDX["I_limit_approx"]]             = _il

@@ -100,7 +100,7 @@ class SimulationEngine:
             )
 
         self.model = REN(
-            input_dim        = 7,
+            input_dim        = 8,
             hidden_dim       = HIDDEN_DIM,
             output_dim       = 1,
             alpha            = ALPHA,
@@ -135,12 +135,13 @@ class SimulationEngine:
         self.sensor     = SensorModel(self.cfg)
         self.cc         = CoulombCounter(self.cfg)
         self.cc.initialize(self.cfg.initial_soc)
-        self.I_cmd      = 0.0
-        self.Q_cmd      = self.cfg.initial_flow
-        self.T_amb      = self.cfg.initial_temperature
-        self.history    = []
-        self.step_count = 0
-        self.t_start    = time.time()
+        self.I_cmd        = 0.0
+        self.Q_cmd        = self.cfg.initial_flow
+        self.T_amb        = self.cfg.initial_temperature
+        self.history      = []
+        self.step_count   = 0
+        self.t_start      = time.time()
+        self._prev_soc_cc = self.cfg.initial_soc
 
     def _reset_ren_state(self):
         """Reset REN hidden state and EMA — use learned z0, not zeros."""
@@ -199,7 +200,8 @@ class SimulationEngine:
         Q  = measured["flow_rate"]
         I  = measured["current"]                           # raw Amps
         il = self._il_const * (max(Q, 1e-6) / self._q_ref) ** 0.4
-        tr = abs(I) / max(il, 1.0)                        # 0 when I = 0
+        tr = abs(I) / max(il, 1.0)
+        elapsed_norm = min(self.step_count / 36000.0, 1.0)  # normalised 0→1 over 10h                        # 0 when I = 0
  
         x = np.array([[
             measured["voltage"],
@@ -209,6 +211,7 @@ class SimulationEngine:
             Q,
             float(soc_cc),
             tr,
+            elapsed_norm,
         ]], dtype=np.float32)
  
         x_s = self.scaler.transform(x).astype(np.float32)
@@ -220,9 +223,9 @@ class SimulationEngine:
         with torch.no_grad():
             y_seq, self.z_ren = self.model(x_t, z=self.z_ren, x_raw=I_raw)
  
-        correction = float(y_seq.squeeze())
-        soc_ren    = float(np.clip(soc_cc + correction, 0.0, 1.0))
-        return soc_ren
+        correction        = float(y_seq.squeeze())
+        self._prev_soc_cc = float(soc_cc)   # track for next step
+        return float(np.clip(soc_cc + correction, 0.0, 1.0))
     # ─────────────────────────────────────────────────────────────────────────
     # SINGLE SIMULATION STEP
     # ─────────────────────────────────────────────────────────────────────────
@@ -256,11 +259,27 @@ class SimulationEngine:
             measured["current"], dt, out["capacity_nominal"]
         )
 
-        # 8. REN inference + EMA smoothing
-        soc_ren      = self._ren_step(measured, soc_cc)
-        raw = soc_ren
-        
-        soc_true = out["soc_true"]
+        # 8. REN inference + dual EMA smoothing
+        # _ren_step returns raw soc_cc + correction (no smoothing)
+        raw = self._ren_step(measured, soc_cc)
+
+        # Fast EMA (τ=30 steps) — used for BMS protection decisions
+        # Responsive enough to track real SOC changes quickly
+        a_fast = 1.0 / EMA_TAU_FAST
+        self.soc_ren_ema_fast = (
+            (1.0 - a_fast) * self.soc_ren_ema_fast + a_fast * raw
+        )
+
+        # Display EMA (τ=120 steps) — shown on dashboard
+        # Longer time constant filters sensor noise → smooth visual trace
+        a_disp = 1.0 / EMA_TAU_DISP
+        self.soc_ren_ema_disp = (
+            (1.0 - a_disp) * self.soc_ren_ema_disp + a_disp * raw
+        )
+
+        soc_ren     = float(np.clip(self.soc_ren_ema_disp, 0.0, 1.0))  # dashboard
+        soc_ren_bms = float(np.clip(self.soc_ren_ema_fast, 0.0, 1.0))  # BMS decisions
+        soc_true    = out["soc_true"]
 
         self.step_count += 1
 
@@ -277,6 +296,7 @@ class SimulationEngine:
             "soc_true"            : round(soc_true, 5),
             "soc_cc"              : round(float(soc_cc), 5),
             "soc_ren"             : round(soc_ren, 5),
+            "soc_ren_bms"         : round(soc_ren_bms, 5),   # BMS (τ=30, responsive)
             "soc_ren_raw"         : round(raw, 5),
             "err_cc"              : round(abs(float(soc_cc) - soc_true), 5),
             "err_ren"             : round(abs(soc_ren - soc_true), 5),

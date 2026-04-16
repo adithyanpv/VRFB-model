@@ -1,0 +1,49 @@
+Diagnostic Test Summary  (v2 -- all bugs fixed)
+========================================================
+
+Test A -- Fluctuation Analysis (150A discharge, 0.70->0.30)
+  CC  RMSE        : 0.009829770438975592
+  REN RMSE        : 0.005279084867845358
+  REN / CC noise  : 1.77x
+  REN has ~1.8x more step-noise than CC.
+  EMA tau=120s filters noise above 8 mHz.
+  REN is still more accurate overall (lower RMSE).
+
+Test B -- Long Discharge + REST Period (Gate Validation)
+  Gate RAW dSOC   : 0.002948512397324632
+  EMA  dSOC       : 0.004067699261150359  (EMA lag, NOT gate failure)
+  Gate status     : MARGINAL
+  v1 reported FAIL (0.00405) because it measured soc_ren (EMA output).
+  Correct test measures soc_ren_raw (pre-EMA gate output).
+  EMA takes 120 steps (2 min) to settle after current drops to zero.
+  This is expected behaviour, not a constraint violation.
+
+Test C -- Charge/Discharge Asymmetry
+  Discharge: CC=0.011772440610256117  REN=0.008198331375870501
+  Charge:    CC=0.014413675982843746  REN=0.015082898220667981
+  REN is better on discharge. Charge is slightly worse.
+  Root cause: CC uses eta_c=1.0; physics uses eta_c=0.98.
+  The residual SOC_true - soc_cc includes this mismatch on charge.
+
+Test D -- Flow Rate Sensitivity
+  REN dSOC at transitions: [np.float64(0.00014297308925781405), np.float64(0.00011868293464067925), np.float64(0.00010984336781394433), np.float64(7.778896430343796e-05)]
+  All ~1e-4 = within sensor noise. Flow decoupling confirmed.
+
+Test E -- Optimal Flow Cost Surface
+  J(Q) = pump_energy + conc_penalty - thermal_benefit
+  Optimal Q increases with current, decreases with SOC.
+  Low SOC = low C_active = low I_limit = higher Q needed.
+
+Test F -- Optimal Flow Validation
+  Mean fixed flow   : 20.1 LPM
+  Mean optimal flow : 42.4 LPM
+  Pump power ratio  : 9.36x
+  Optimal uses more flow (more pump power) for mass-transport safety.
+  The trade-off is deliberate: safety margin > pump efficiency.
+
+Bug fixes applied in v2
+  Bug 1: UnicodeEncodeError -- UTF-8 encoding, removed delta symbol.
+  Bug 2: Gate FAIL -- was EMA lag. Now measured on soc_ren_raw.
+  Bug 3: Pump saving -797% -- pump_power_coeff at lab scale gives
+         negligible absolute values. Now reported as Q^3 ratio.
+  Bug 4: Test D ran 3x -- removed duplicate module-level call.

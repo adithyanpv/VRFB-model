@@ -67,10 +67,11 @@ FEATURE_COLS = [
     "temperature_tank",
     "flow_rate",
     "soc_cc",                     # CC estimate as context for correction
-    "transport_ratio_approx",     # |I|/I_limit_approx — 0 at I=0 (safe)
+    "transport_ratio_approx",
+    "elapsed_time_norm"     # |I|/I_limit_approx — 0 at I=0 (safe)
 ]
 TARGET_COL  = "target"            # SOC_true - soc_cc  (residual correction)
-INPUT_DIM   = len(FEATURE_COLS)   # 7
+INPUT_DIM   = len(FEATURE_COLS)   # 8
 CURRENT_IDX = 1                   # index of "current" in FEATURE_COLS
 
 # Model
@@ -80,7 +81,7 @@ DROPOUT       = 0.1
 N_POWER_ITERS = 10
 
 # Training
-SEQ_LEN          = 256
+SEQ_LEN          = 512
 BATCH_SIZE       = 32
 EPOCHS           = 80
 LR               = 3e-4
