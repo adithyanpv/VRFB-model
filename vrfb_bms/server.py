@@ -1,15 +1,23 @@
 # vrfb_bms/server.py
 """
-VRFB Battery Management System — Real-Time Web Server 1.7
-======================================================
-FastAPI + WebSocket server that runs the VRFB digital twin at 1 Hz,
-applies the 7-layer BMS with operational mode state machine,
-runs REN SOC inference every step, and broadcasts live data
-(including half-cell SOC and imbalance) to all connected dashboard clients.
+VRFB BMS — Real-Time Web Server  v2.0  (Pure Observer)
+=======================================================
+
+CHANGES FROM v1.x
+-----------------
+  - input_dim reduced from 9 to 6 (pure observer architecture)
+  - PI observer / bias integrator completely removed from _ren_step
+  - cumulative_ah_norm removed (OOD after training horizon)
+  - bias_est removed (caused runaway feedback at long duration)
+  - transport_ratio_approx removed (redundant, derived)
+  - _ren_step now uses 6 raw physical features only
+  - Final SOC = clip(soc_cc + ren_correction, 0, 1)
+  - Transition dampening retained (suppresses post-rest OCV spike)
+  - Dual EMA retained (fast tau=30 for BMS, display tau=120 for chart)
+  - soc_ren_hybrid broadcast retained (fast EMA on chart)
 
 USAGE:
   uvicorn vrfb_bms.server:app --reload --port 8000
-  open http://localhost:8000
 """
 
 import asyncio
@@ -33,8 +41,8 @@ from vrfb.sensor_model    import SensorModel
 from vrfb.coulomb_counter import CoulombCounter
 from ren.ren_model        import REN
 
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR  = os.path.join(BASE_DIR, "static")
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 HIDDEN_DIM     = 128
 ALPHA          = 0.5
@@ -42,13 +50,13 @@ DEVICE         = torch.device("cpu")
 SIM_HZ         = 1.0
 STEPS_PER_TICK = 10
 HISTORY_LEN    = 300
-EMA_TAU_FAST = 30     # used for BMS protection decisions (responsive)
-EMA_TAU_DISP = 120    # used for dashboard display (smooth visual)
+EMA_TAU_FAST   = 30    # responsive — BMS decisions + soc_ren_hybrid on chart
+EMA_TAU_DISP   = 120   # smooth visual — soc_ren on chart
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONNECTION MANAGER  — only manages WebSocket connections, nothing else
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# CONNECTION MANAGER
+# =============================================================================
 
 class ConnectionManager:
     def __init__(self):
@@ -74,9 +82,9 @@ class ConnectionManager:
             self.disconnect(ws)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SIMULATION ENGINE  — all physics, BMS, REN logic lives here
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# SIMULATION ENGINE
+# =============================================================================
 
 class SimulationEngine:
 
@@ -87,20 +95,18 @@ class SimulationEngine:
         model_path  = os.path.join(proj_root, "ren", "ren_soc_best.pth")
         scaler_path = os.path.join(proj_root, "ren", "scaler.pkl")
 
-        # ── Load REN model ────────────────────────────────────────────────
         if not os.path.exists(model_path):
             raise FileNotFoundError(
-                f"REN model not found at:\n  {model_path}\n"
-                "Run train_ren.py first."
+                f"REN model not found: {model_path}\nRun train_ren.py first."
             )
         if not os.path.exists(scaler_path):
             raise FileNotFoundError(
-                f"Scaler not found at:\n  {scaler_path}\n"
-                "Run train_ren.py first."
+                f"Scaler not found: {scaler_path}\nRun train_ren.py first."
             )
 
+        # Pure observer: 6 features — voltage, current, T_stack, T_tank, flow, soc_cc
         self.model = REN(
-            input_dim        = 8,
+            input_dim        = 7,
             hidden_dim       = HIDDEN_DIM,
             output_dim       = 1,
             alpha            = ALPHA,
@@ -118,37 +124,34 @@ class SimulationEngine:
         with open(scaler_path, "rb") as f:
             self.scaler = pickle.load(f)
 
-        # I_limit approximation constants (hardware-estimable, no ODE access)
-        self._il_const = 1 * 96485.0 * 2e-5 * 0.15 * 1600.0 * 0.5  # ~231.6 A
-        self._q_ref    = 20.0 / 60000.0   # 20 LPM in m³/s
-
-        # Initialise simulation state and REN hidden state
         self._init_sim()
         self._reset_ren_state()
 
     # ─────────────────────────────────────────────────────────────────────────
 
     def _init_sim(self):
-        """Initialise / re-initialise simulation objects only (not the model)."""
-        self.battery    = VRFB(self.cfg)
-        self.bms        = BMSController(self.cfg)
-        self.sensor     = SensorModel(self.cfg)
-        self.cc         = CoulombCounter(self.cfg)
+        self.battery          = VRFB(self.cfg)
+        self.bms              = BMSController(self.cfg)
+        self.sensor           = SensorModel(self.cfg)
+        self.cc               = CoulombCounter(self.cfg)
         self.cc.initialize(self.cfg.initial_soc)
-        self.I_cmd        = 0.0
-        self.Q_cmd        = self.cfg.initial_flow
-        self.T_amb        = self.cfg.initial_temperature
-        self.history      = []
-        self.step_count   = 0
-        self.t_start      = time.time()
-        self._prev_soc_cc = self.cfg.initial_soc
+        self.I_cmd            = 0.0
+        self.Q_cmd            = self.cfg.initial_flow
+        self.T_amb            = self.cfg.initial_temperature
+        self.history          = []
+        self.step_count       = 0
+        self.t_start          = time.time()
+        self._prev_bms_mode   = "standby"
+        self._transition_steps = 0
+        # No bias integrator, no cumulative_ah — pure observer
 
     def _reset_ren_state(self):
-        """Reset REN hidden state and EMA — use learned z0, not zeros."""
         with torch.no_grad():
             self.z_ren = self.model.z0.detach().clone()
-        self.soc_ren_ema_fast = self.cfg.initial_soc   # for BMS
-        self.soc_ren_ema_disp = self.cfg.initial_soc   # for display
+        self.soc_ren_ema_fast  = self.cfg.initial_soc
+        self.soc_ren_ema_disp  = self.cfg.initial_soc
+        self._prev_bms_mode    = "standby"
+        self._transition_steps = 0
 
     # ─────────────────────────────────────────────────────────────────────────
     # BMS FLAGS
@@ -158,7 +161,6 @@ class SimulationEngine:
         cfg    = self.cfg
         mode   = self.bms.mode
         active = mode in (BMSMode.CHARGE, BMSMode.DISCHARGE)
-
         return {
             "mode_standby"  : mode is BMSMode.STANDBY,
             "mode_startup"  : mode is BMSMode.STARTUP,
@@ -186,46 +188,46 @@ class SimulationEngine:
         }
 
     # ─────────────────────────────────────────────────────────────────────────
-    # REN INFERENCE
+    # REN INFERENCE  — Pure Observer, 6 features, no feedback loop
     # ─────────────────────────────────────────────────────────────────────────
 
     def _ren_step(self, measured: dict, soc_cc: float) -> float:
         """
-        7-feature hybrid inference: 5 sensors + soc_cc + transport_ratio_approx.
- 
-        GATE FIX: raw current (Amps) passed as x_raw so gate closes at I=0A.
-        Previously no x_raw was passed — gate used scaled current and never
-        closed at zero current (gate ≈ 0.44 instead of 0.0 at I=0A).
+        6-feature pure observer inference.
+
+        Features: voltage, current, T_stack, T_tank, flow_rate, soc_cc
+
+        No PI observer. No bias_est. No cumulative_ah_norm.
+        The REN hidden state z is the sole non-linear integrator.
+
+        final_soc = clip(soc_cc + ren_correction, 0, 1)
         """
-        Q  = measured["flow_rate"]
-        I  = measured["current"]                           # raw Amps
-        il = self._il_const * (max(Q, 1e-6) / self._q_ref) ** 0.4
-        tr = abs(I) / max(il, 1.0)
-        elapsed_norm = min(self.step_count / 36000.0, 1.0)  # normalised 0→1 over 10h                        # 0 when I = 0
- 
+       # Ohmic-corrected OCV (same constant used in dataset_gen.py)
+        _R_STACK = (0.0015 + 0.0005) * 40   # 0.08 Ω
+        v_ocv    = measured["voltage"] - measured["current"] * _R_STACK
+
         x = np.array([[
             measured["voltage"],
-            I,
+            measured["current"],
             measured["temperature"],
             measured["temperature_tank"],
-            Q,
+            measured["flow_rate"],
             float(soc_cc),
-            tr,
-            elapsed_norm,
+            float(v_ocv),
         ]], dtype=np.float32)
- 
-        x_s = self.scaler.transform(x).astype(np.float32)
-        x_t = torch.tensor(x_s).unsqueeze(0).to(DEVICE)
- 
-        # Raw current as (1, 1, 1) tensor in Amps — gate uses this, not scaled value
-        I_raw = torch.tensor([[[I]]], dtype=torch.float32).to(DEVICE)
- 
+
+        x_s   = self.scaler.transform(x).astype(np.float32)
+        x_t   = torch.tensor(x_s).unsqueeze(0).to(DEVICE)
+
+        # Gate uses raw Amps — reconstruct from measured current
+        I_raw = torch.tensor([[[measured["current"]]]], dtype=torch.float32).to(DEVICE)
+
         with torch.no_grad():
             y_seq, self.z_ren = self.model(x_t, z=self.z_ren, x_raw=I_raw)
- 
-        correction        = float(y_seq.squeeze())
-        self._prev_soc_cc = float(soc_cc)   # track for next step
-        return float(np.clip(soc_cc + correction, 0.0, 1.0))
+
+        correction = float(y_seq.squeeze())
+        return float(np.clip(float(soc_cc) + correction, 0.0, 1.0))
+
     # ─────────────────────────────────────────────────────────────────────────
     # SINGLE SIMULATION STEP
     # ─────────────────────────────────────────────────────────────────────────
@@ -234,52 +236,41 @@ class SimulationEngine:
         dt  = self.cfg.dt_default
         out = self.battery.get_outputs()
 
-        # 1. Mode state machine
         self.bms.update_mode(self.I_cmd, out, dt)
-
-        # 2. Flow override (startup flush / standby drain)
         flow_override = self.bms.get_flow_override()
-        Q_eff = flow_override if flow_override is not None else self.Q_cmd
-
-        # 3. Protection hierarchy → safe current
+        Q_eff  = flow_override if flow_override is not None else self.Q_cmd
         I_safe = self.bms.apply_protection(self.I_cmd, out)
+        flags  = self._bms_flags(out, self.I_cmd, I_safe)
 
-        # 4. BMS flags for dashboard
-        flags = self._bms_flags(out, self.I_cmd, I_safe)
-
-        # 5. Advance physics
         self.battery.step(I_safe, Q_eff, self.T_amb, dt)
         out = self.battery.get_outputs()
 
-        # 6. Sensor measurement
         measured = self.sensor.measure(out)
+        soc_cc   = self.cc.update(measured["current"], dt, out["capacity_nominal"])
 
-        # 7. Coulomb counter
-        soc_cc = self.cc.update(
-            measured["current"], dt, out["capacity_nominal"]
-        )
-
-        # 8. REN inference + dual EMA smoothing
-        # _ren_step returns raw soc_cc + correction (no smoothing)
+        # REN inference — pure observer, no feedback
         raw = self._ren_step(measured, soc_cc)
 
-        # Fast EMA (τ=30 steps) — used for BMS protection decisions
-        # Responsive enough to track real SOC changes quickly
+        # Transition dampening: suppress post-rest OCV spike when mode changes
+        cur_mode = self.bms.mode_name
+        if cur_mode != self._prev_bms_mode:
+            self._transition_steps = 0
+        self._prev_bms_mode = cur_mode
+        self._transition_steps += 1
+
+        if self._transition_steps < 60 and cur_mode in ("discharge", "charge"):
+            blend = self._transition_steps / 60.0
+            raw   = (1.0 - blend) * self.soc_ren_ema_disp + blend * raw
+
+        # Dual EMA
         a_fast = 1.0 / EMA_TAU_FAST
-        self.soc_ren_ema_fast = (
-            (1.0 - a_fast) * self.soc_ren_ema_fast + a_fast * raw
-        )
-
-        # Display EMA (τ=120 steps) — shown on dashboard
-        # Longer time constant filters sensor noise → smooth visual trace
         a_disp = 1.0 / EMA_TAU_DISP
-        self.soc_ren_ema_disp = (
-            (1.0 - a_disp) * self.soc_ren_ema_disp + a_disp * raw
-        )
+        self.soc_ren_ema_fast = (1.0 - a_fast) * self.soc_ren_ema_fast + a_fast * raw
+        self.soc_ren_ema_disp = (1.0 - a_disp) * self.soc_ren_ema_disp + a_disp * raw
 
-        soc_ren     = float(np.clip(self.soc_ren_ema_disp, 0.0, 1.0))  # dashboard
-        soc_ren_bms = float(np.clip(self.soc_ren_ema_fast, 0.0, 1.0))  # BMS decisions
-        soc_true    = out["soc_true"]
+        soc_ren        = float(np.clip(self.soc_ren_ema_disp, 0.0, 1.0))  # dashboard
+        soc_ren_hybrid = float(np.clip(self.soc_ren_ema_fast, 0.0, 1.0))  # BMS / chart
+        soc_true       = out["soc_true"]
 
         self.step_count += 1
 
@@ -293,29 +284,38 @@ class SimulationEngine:
             "t"                   : self.step_count,
             "elapsed_s"           : round(time.time() - self.t_start, 1),
             "sim_time_s"          : self.step_count,
+            # SOC estimators
             "soc_true"            : round(soc_true, 5),
             "soc_cc"              : round(float(soc_cc), 5),
-            "soc_ren"             : round(soc_ren, 5),
-            "soc_ren_bms"         : round(soc_ren_bms, 5),   # BMS (τ=30, responsive)
-            "soc_ren_raw"         : round(raw, 5),
+            "soc_ren"             : round(soc_ren, 5),           # display EMA tau=120
+            "soc_ren_hybrid"      : round(soc_ren_hybrid, 5),    # fast EMA tau=30
+            "soc_ren_raw"         : round(raw, 5),               # pre-EMA (diagnostic)
+            # Errors
             "err_cc"              : round(abs(float(soc_cc) - soc_true), 5),
             "err_ren"             : round(abs(soc_ren - soc_true), 5),
-            "soc_neg"             : round(out["soc_neg"],        5),
-            "soc_pos"             : round(out["soc_pos"],        5),
-            "soc_system"          : round(out["soc_system"],     5),
-            "soc_imbalance"       : round(out["soc_imbalance"],  5),
-            "voltage"             : round(measured["voltage"],   3),
-            "current"             : round(measured["current"],   2),
-            "current_cmd"         : round(self.I_cmd,            1),
-            "current_safe"        : round(I_safe,                2),
-            "i_limit"             : round(out["i_limit"],        1),
+            "err_ren_hybrid"      : round(abs(soc_ren_hybrid - soc_true), 5),
+            # Half-cell SOC
+            "soc_neg"             : round(out["soc_neg"],       5),
+            "soc_pos"             : round(out["soc_pos"],       5),
+            "soc_system"          : round(out["soc_system"],    5),
+            "soc_imbalance"       : round(out["soc_imbalance"], 5),
+            # Electrical
+            "voltage"             : round(measured["voltage"],  3),
+            "current"             : round(measured["current"],  2),
+            "current_cmd"         : round(self.I_cmd,           1),
+            "current_safe"        : round(I_safe,               2),
+            "i_limit"             : round(out["i_limit"],       1),
             "transport_ratio"     : round(out["transport_ratio"], 4),
+            # Thermal
             "temp_stack"          : round(measured["temperature"],      2),
             "temp_tank"           : round(measured["temperature_tank"], 2),
             "temp_ambient"        : round(self.T_amb,                   1),
+            # Hydraulic
             "flow_lpm"            : round(out["flow_rate"] * 60000,     2),
             "flow_override"       : flow_override is not None,
+            # Degradation
             "capacity_ah"         : round(out["capacity_nominal"],      1),
+            # BMS
             "bms_mode"            : self.bms.mode_name,
             "bms_standby_timer_s" : round(self.bms.standby_timer, 1),
             "bms_startup_pct"     : round(self.bms.startup_progress * 100, 1),
@@ -326,8 +326,8 @@ class SimulationEngine:
 
         self.history.append({
             k: snap[k] for k in [
-                "t", "soc_true", "soc_cc", "soc_ren",
-                "voltage", "current", "err_cc", "err_ren",
+                "t", "soc_true", "soc_cc", "soc_ren", "soc_ren_hybrid",
+                "voltage", "current", "err_cc", "err_ren", "err_ren_hybrid",
                 "soc_neg", "soc_pos", "soc_imbalance",
             ]
         })
@@ -335,10 +335,6 @@ class SimulationEngine:
             self.history.pop(0)
 
         return snap
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # CONTROL INTERFACE
-    # ─────────────────────────────────────────────────────────────────────────
 
     def set_control(
         self,
@@ -348,7 +344,6 @@ class SimulationEngine:
         reset:    bool = False,
     ):
         if reset:
-            # Rebuild simulation state only — model stays loaded, no disk I/O
             self._init_sim()
             self._reset_ren_state()
             return
@@ -363,14 +358,11 @@ class SimulationEngine:
         return self.history
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # FASTAPI APPLICATION
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
-# manager is safe at module level — it has no imports that can fail
 manager = ConnectionManager()
-
-# engine is created inside lifespan so startup errors show the real exception
 engine: Optional[SimulationEngine] = None
 
 
@@ -414,8 +406,7 @@ async def websocket_endpoint(ws: WebSocket):
     await manager.connect(ws)
     try:
         await ws.send_text(json.dumps({
-            "type": "history",
-            "history": engine.get_history()
+            "type": "history", "history": engine.get_history()
         }))
     except Exception:
         pass
