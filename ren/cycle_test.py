@@ -62,8 +62,8 @@ CURRENT_IDX  = 1
 _R_STACK_NOMINAL = (0.0015 + 0.0005) * 40   # 0.08 Ω — from config.py
 
 FEATURE_COLS = [
-    "voltage", "current", "temperature_stack",
-    "temperature_tank", "flow_rate", "soc_cc", "v_ocv_approx",
+    "v_ocv_approx", "current", "temperature_stack",
+    "temperature_tank", "flow_rate", "soc_cc",
 ]
 DEVICE = torch.device("cpu")
 C_TRUE = "#00e5ff"
@@ -146,7 +146,7 @@ def run_cycle_test(args):
 
     # Load model — 6 features
     model = REN(
-        input_dim        = 7,
+        input_dim        = 6,
         hidden_dim       = HIDDEN_DIM,
         output_dim       = 1,
         alpha            = ALPHA,
@@ -220,16 +220,14 @@ def run_cycle_test(args):
         measured = sensor.measure(out)
         soc_cc   = float(cc.update(measured["current"], dt, out["capacity_nominal"]))
 
-        # Pure observer: 6-feature vector, no PI observer
         v_ocv = measured["voltage"] - measured["current"] * _R_STACK_NOMINAL
         x = np.array([[
-            measured["voltage"],
+            float(v_ocv),               # v_ocv_approx — sole voltage signal
             measured["current"],
             measured["temperature"],
             measured["temperature_tank"],
             measured["flow_rate"],
             soc_cc,
-            float(v_ocv),
         ]], dtype=np.float32)
 
         x_s   = scaler.transform(x).astype(np.float32)

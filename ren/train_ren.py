@@ -60,13 +60,15 @@ np.random.seed(SEED)
 
 # ── 6 strictly observable features — must match dataset_gen.py exactly ───────
 FEATURE_COLS = [
-    "voltage",
-    "current",
+    "v_ocv_approx",      # SOLE voltage signal — Nernst OCV without Ohmic contamination
+                         # v_ocv = V_terminal - I*R_nom; smooth at current reversals
+                         # 'voltage' removed: V_terminal = v_ocv + I*R is linearly
+                         # dependent given 'current' → collinearity causes overfitting
+    "current",           # I=0 → gate closes → z frozen (Faraday); independent signal
     "temperature_stack",
     "temperature_tank",
     "flow_rate",
-    "soc_cc",
-    "v_ocv_approx",           # raw drifting CC — REN learns to correct this
+    "soc_cc",          # raw drifting CC — REN learns to correct this
 ]
 TARGET_COL  = "target"           # SOC_true - soc_cc  (raw CC drift)
 INPUT_DIM   = len(FEATURE_COLS)  # 6
@@ -74,7 +76,7 @@ CURRENT_IDX = 1                  # index of "current" in FEATURE_COLS
 
 # Model
 HIDDEN_DIM    = 128
-ALPHA         = 0.3
+ALPHA         = 0.5
 DROPOUT       = 0.1
 N_POWER_ITERS = 10
 
@@ -100,22 +102,19 @@ HARD_CASE_THRESH = 0.10
 ZC_WEIGHT   = 2.0
 ZC_I_THRESH = 2.0
 
-# Smooth loss (penalises large step-to-step correction changes at low current)
-SMOOTH_WEIGHT = 0.30   # was 0.10 — stronger smoothing on low-current transitions
-SMOOTH_I_REF  = 0.3    # scaled current units
-
-# Drift regularisation: rolling 1-hour window mean(correction) ≈ mean(target)
-# Critical for long-term bounded error — forces multi-hour consistency
-DRIFT_WEIGHT = 1.0
-DRIFT_WINDOW = 3600    # 1-hour rolling window at dt=1s
-
-# Bias penalty: episode-level mean(correction) ≈ mean(target)
-# Directly penalises systematic under/over-correction
-BIAS_PENALTY_WEIGHT = 1.0  #was 2.0 
-
-# z0 regularisation: suppresses the init spike at step 0
-Z0_REG_WEIGHT = 2.0 #was 0.5
-TRANSITION_WEIGHT = 1.0
+SMOOTH_WEIGHT = 0.15       # reduced from 0.30 — less smoothing allows step tracking
+SMOOTH_I_REF  = 0.3
+DRIFT_WEIGHT  = 0.30       # was 1.0 — 1.0 was overpowering MSE, making model output
+                           # the average drift instead of tracking it step-by-step.
+                           # Correlation dropped to -0.57 because the model satisfied
+                           # the 1-hour mean constraint by outputting a flat constant.
+                           # 0.30 keeps the long-horizon signal without killing precision.
+DRIFT_WINDOW  = 3600
+BIAS_PENALTY_WEIGHT = 0.50 # was 1.0 — same issue as DRIFT_WEIGHT
+Z0_REG_WEIGHT = 3.0        # increased from 2.0 — harder constraint on init spike.
+                           # z0_norm=1.08 caused visible 0.07 correction spike at t=0.
+                           # 3.0 forces z0 output near-zero regardless of z0_norm.
+TRANSITION_WEIGHT = 0.50   # reduced from 1.0
 
 TRAIN_CSV = "datasets/vrfb_train.csv"
 TEST_CSV  = "datasets/vrfb_test.csv"

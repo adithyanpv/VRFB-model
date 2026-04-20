@@ -48,13 +48,12 @@ warnings.filterwarnings("ignore")
 
 # ── Must match train_ren.py FEATURE_COLS exactly ─────────────────────────────
 FEATURE_COLS = [
-    "voltage",
+   "v_ocv_approx",      # sole voltage signal — V_terminal removed (collinearity fix)
     "current",
     "temperature_stack",
     "temperature_tank",
     "flow_rate",
-    "soc_cc",
-    "v_ocv_approx",    # Ohmic-corrected Nernst voltage
+    "soc_cc",   # Ohmic-corrected Nernst voltage
 ]
 TARGET_COL   = "SOC_true"
 CURRENT_IDX  = 1

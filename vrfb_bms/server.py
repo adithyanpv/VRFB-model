@@ -106,7 +106,7 @@ class SimulationEngine:
 
         # Pure observer: 6 features — voltage, current, T_stack, T_tank, flow, soc_cc
         self.model = REN(
-            input_dim        = 7,
+            input_dim        = 6,
             hidden_dim       = HIDDEN_DIM,
             output_dim       = 1,
             alpha            = ALPHA,
@@ -203,17 +203,19 @@ class SimulationEngine:
         final_soc = clip(soc_cc + ren_correction, 0, 1)
         """
        # Ohmic-corrected OCV (same constant used in dataset_gen.py)
-        _R_STACK = (0.0015 + 0.0005) * 40   # 0.08 Ω
+        # v_ocv_approx is the SOLE voltage signal — no raw terminal voltage.
+        # V_ocv = V_terminal - I*R_nom removes Ohmic jump at current reversal.
+        # Using both V_terminal and V_ocv caused collinearity → overfitting.
+        _R_STACK = (0.0015 + 0.0005) * 40   # 0.08 Ω — commissioning constant
         v_ocv    = measured["voltage"] - measured["current"] * _R_STACK
 
         x = np.array([[
-            measured["voltage"],
-            measured["current"],
+            float(v_ocv),               # v_ocv_approx — Nernst signal only
+            measured["current"],        # independent gate signal
             measured["temperature"],
             measured["temperature_tank"],
             measured["flow_rate"],
             float(soc_cc),
-            float(v_ocv),
         ]], dtype=np.float32)
 
         x_s   = self.scaler.transform(x).astype(np.float32)
