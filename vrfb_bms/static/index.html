@@ -28,6 +28,50 @@
   --sans:      'Barlow Condensed', sans-serif;
   --body:      'Barlow', sans-serif;
 }
+
+/* ── IFC TOGGLE BUTTON ── */
+.ifc-toggle {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  font-weight: 700;
+  padding: 6px 12px;
+  border-radius: 4px;
+  border: 1.5px solid var(--purple);
+  background: transparent;
+  color: var(--purple);
+  cursor: pointer;
+  transition: all .25s;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.ifc-toggle.ifc-on {
+  background: var(--purple);
+  color: #0a0818;
+  box-shadow: 0 0 14px var(--purple), 0 0 28px rgba(179,136,255,.3);
+}
+.ifc-toggle:hover { opacity: .85; }
+
+/* ── IFC BADGE on flow metric ── */
+.ifc-badge {
+  display: none;
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 1px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: rgba(179,136,255,.15);
+  border: 1px solid var(--purple);
+  color: var(--purple);
+  margin-left: 6px;
+  vertical-align: middle;
+  animation: ifc-pulse 2s ease-in-out infinite;
+}
+.ifc-badge.visible { display: inline-block; }
+@keyframes ifc-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.55; }
+}
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 body {
@@ -458,7 +502,7 @@ body::after {
       <div class="panel-label">FLOW / TRANSPORT</div>
       <div class="metric-block">
         <div class="metric-name">FLOW RATE</div>
-        <div class="metric-val" id="mFlow" style="color:var(--cyan);font-size:22px;">—<span class="metric-unit">LPM</span></div>
+        <div class="metric-val" id="mFlow" style="color:var(--cyan);font-size:22px;">—<span class="metric-unit">LPM</span><span class="ifc-badge" id="ifcBadge">AI OPTIMIZED</span></div>
         <div class="metric-bar"><div class="metric-bar-fill" id="bFlow" style="background:var(--cyan);width:33%"></div></div>
       </div>
       <div class="metric-block">
@@ -495,11 +539,15 @@ body::after {
       </div>
     </div>
     <div class="control-group">
-      <div class="ctrl-label">Flow Rate (LPM)</div>
+      <div class="ctrl-label" style="display:flex;align-items:center;justify-content:space-between;">
+        <span>Flow Rate (LPM)</span>
+        <button class="ifc-toggle" id="ifcToggle" onclick="toggleIFC()">⚡ AI AUTO FLOW</button>
+      </div>
       <div class="ctrl-row">
         <input type="range" class="ctrl-slider" id="sliderQ" min="5" max="60" step="1" value="20">
         <div class="ctrl-val" id="valQ">20 LPM</div>
       </div>
+      <div id="ifcStatus" style="font-family:var(--mono);font-size:9px;color:var(--text-dim);letter-spacing:1px;margin-top:4px;min-height:14px;"></div>
     </div>
     <div class="control-group">
       <div class="ctrl-label">Ambient Temperature (K)</div>
@@ -710,7 +758,12 @@ function updateDash(d) {
   document.getElementById('bTemp').style.background = tc;
 
   // Flow
-  document.getElementById('mFlow').innerHTML      = `${d.flow_lpm.toFixed(1)}<span class="metric-unit">LPM</span>`;
+  const flowColor = d.ifc_active ? 'var(--purple)' : 'var(--cyan)';
+  document.getElementById('mFlow').style.color = flowColor;
+  document.getElementById('mFlow').innerHTML =
+    `${d.flow_lpm.toFixed(1)}<span class="metric-unit">LPM</span>` +
+    `<span class="ifc-badge${d.ifc_active ? ' visible' : ''}" id="ifcBadge">AI OPTIMIZED</span>`;
+  document.getElementById('bFlow').style.background = flowColor;
   document.getElementById('mIlimit').innerHTML    = `${d.i_limit.toFixed(0)}<span class="metric-unit">A</span>`;
   document.getElementById('mTransport').textContent = d.transport_ratio.toFixed(3);
   document.getElementById('bFlow').style.width      = pct(d.flow_lpm, 0, 60);
@@ -768,6 +821,10 @@ function updateDash(d) {
     document.getElementById('statRenHybridMae').textContent = mae_ren_hybrid;
   }
 
+  // When IFC is active, keep the slider label in sync with the AI-chosen flow
+  if (d.ifc_active && d.ifc_flow_lpm !== null) {
+    document.getElementById('valQ').textContent = d.ifc_flow_lpm.toFixed(1) + ' LPM';
+  }
   const nActive = Object.values(f).filter(Boolean).length;
   document.getElementById('statBms').textContent = nActive;
   document.getElementById('statBms').style.color = nActive > 0 ? 'var(--red)' : 'var(--green)';
@@ -776,8 +833,38 @@ function updateDash(d) {
 }
 
 // ── Controls ───────────────────────────────────────────────────────────────
+let ifcEnabled = false;   // Intelligent Flow Controller state
+
 function sendControl(obj) {
   fetch('/control', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(obj) });
+}
+
+function toggleIFC() {
+  ifcEnabled = !ifcEnabled;
+  const btn    = document.getElementById('ifcToggle');
+  const slider = document.getElementById('sliderQ');
+  const status = document.getElementById('ifcStatus');
+
+  if (ifcEnabled) {
+    btn.classList.add('ifc-on');
+    btn.textContent = '⚡ AI AUTO FLOW  ON';
+    // Visually disable manual slider — IFC owns the pump
+    slider.disabled = true;
+    slider.style.opacity = '0.3';
+    slider.style.cursor  = 'not-allowed';
+    status.textContent   = 'PUMP CONTROLLED BY REN SOC ESTIMATE';
+    status.style.color   = 'var(--purple)';
+  } else {
+    btn.classList.remove('ifc-on');
+    btn.textContent = '⚡ AI AUTO FLOW';
+    slider.disabled = false;
+    slider.style.opacity = '1';
+    slider.style.cursor  = 'pointer';
+    status.textContent   = '';
+    // Restore slider value to backend
+    sendControl({ flow_lpm: parseFloat(slider.value) });
+  }
+  sendControl({ auto_flow: ifcEnabled });
 }
 
 document.getElementById('sliderI').addEventListener('input', e => {
@@ -786,6 +873,7 @@ document.getElementById('sliderI').addEventListener('input', e => {
   sendControl({ I_cmd: v });
 });
 document.getElementById('sliderQ').addEventListener('input', e => {
+  if (ifcEnabled) return;  // IFC owns the pump — ignore manual input
   const v = parseFloat(e.target.value);
   document.getElementById('valQ').textContent = v + ' LPM';
   sendControl({ flow_lpm: v });
@@ -803,6 +891,8 @@ function setPreset(v) {
 }
 
 function resetSim() {
+  // Turn off IFC before resetting so the engine restarts in manual mode
+  if (ifcEnabled) toggleIFC();
   sessionErrRen = []; sessionErrCC = []; sessionErrRenHybrid = [];
   [socChart, errChart].forEach(c => {
     c.data.labels = [];

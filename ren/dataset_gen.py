@@ -262,7 +262,7 @@ for ep in tqdm(range(N_EPISODES), desc="Generating episodes"):
     cc      = CoulombCounter(cfg)
     cc.initialize(soc_cc_init)
     sensor.set_current_bias(current_bias)
-    cc.set_current_bias(current_bias)
+    
 
     # ── Half-cell imbalance injection ─────────────────────────────────────
     _r = rng.random()

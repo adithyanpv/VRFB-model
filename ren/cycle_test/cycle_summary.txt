@@ -7,12 +7,12 @@ CC bias     : 3.00 A
 
 Metric                   CC+REN          CC   Improvement
 --------------------------------------------------------
-RMSE                    0.06173     0.08442        +26.9%
-MAE                     0.05002     0.07503        +33.3%
-Max Err                 0.13435     0.13539         +0.8%
-Bias                   -0.03475    -0.07503           ---
+RMSE                    0.03581     0.03640         +1.6%
+MAE                     0.03256     0.03321         +2.0%
+Max Err                 0.06086     0.06008         -1.3%
+Bias                   -0.03255    -0.03321           ---
 
-Cycles improved : 4/5
-Corr(CC_err, correction) : -0.1047  (target -1.0)
-CC RMSE trend  : +0.026306/cycle
-REN RMSE trend : +0.013494/cycle
+Cycles improved : 5/5
+Corr(CC_err, correction) : -0.2828  (target -1.0)
+CC RMSE trend  : +0.009759/cycle
+REN RMSE trend : +0.009555/cycle

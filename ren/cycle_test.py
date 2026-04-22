@@ -176,7 +176,7 @@ def run_cycle_test(args):
 
     cc_init = float(np.clip(args.soc_high + args.cc_init_err, 0.06, 0.94))
     cc.initialize(cc_init)
-    cc.set_current_bias(args.cc_bias)
+    
     sensor.set_current_bias(args.cc_bias)
 
     # REN state — no PI observer state needed

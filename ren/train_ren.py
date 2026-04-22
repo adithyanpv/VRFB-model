@@ -102,19 +102,18 @@ HARD_CASE_THRESH = 0.10
 ZC_WEIGHT   = 2.0
 ZC_I_THRESH = 2.0
 
-SMOOTH_WEIGHT = 0.15       # reduced from 0.30 — less smoothing allows step tracking
+SMOOTH_WEIGHT = 0.20
 SMOOTH_I_REF  = 0.3
-DRIFT_WEIGHT  = 0.30       # was 1.0 — 1.0 was overpowering MSE, making model output
-                           # the average drift instead of tracking it step-by-step.
-                           # Correlation dropped to -0.57 because the model satisfied
-                           # the 1-hour mean constraint by outputting a flat constant.
-                           # 0.30 keeps the long-horizon signal without killing precision.
-DRIFT_WINDOW  = 3600
-BIAS_PENALTY_WEIGHT = 0.50 # was 1.0 — same issue as DRIFT_WEIGHT
-Z0_REG_WEIGHT = 3.0        # increased from 2.0 — harder constraint on init spike.
-                           # z0_norm=1.08 caused visible 0.07 correction spike at t=0.
-                           # 3.0 forces z0 output near-zero regardless of z0_norm.
-TRANSITION_WEIGHT = 0.50   # reduced from 1.0
+DRIFT_WEIGHT  = 0.80        # restored — needed to penalise multi-hour trend mismatch
+DRIFT_WINDOW  = 128
+BIAS_PENALTY_WEIGHT = 1.0   # restored — penalises constant offset directly
+Z0_REG_WEIGHT = 2.0
+TRANSITION_WEIGHT = 0.50
+PEARSON_WEIGHT = 0.30
+SLOPE_WEIGHT  = 0.50
+       # Pearson correlation loss — breaks flat-constant local minimum
+                            # A constant correction has r=0 with a dynamic target.
+                            # Penalty = (1 - r)² pushes model toward r=1.0 (perfect tracking)
 
 TRAIN_CSV = "datasets/vrfb_train.csv"
 TEST_CSV  = "datasets/vrfb_test.csv"
@@ -209,23 +208,79 @@ def composite_loss(
         zc_loss = torch.tensor(0.0)
 
     # Drift regularisation — rolling 1-hour window consistency
-    if pred.shape[1] >= DRIFT_WINDOW:
-        hw          = DRIFT_WINDOW // 2
-        pred_roll   = pred[:, :pred.shape[1]-hw, :].unfold(1, hw, 1).mean(dim=-1)
-        target_roll = target[:, :target.shape[1]-hw, :].unfold(1, hw, 1).mean(dim=-1)
-        drift_loss  = ((pred_roll - target_roll)**2).mean()
-    else:
-        drift_loss = ((pred.mean(dim=1) - target.mean(dim=1))**2).mean()
+    # Drift regularisation — rolling window mean consistency.
+    # DRIFT_WINDOW (128) < SEQ_LEN (512), so this branch always executes now.
+    # Computes rolling mean of pred and target over 128-step windows, then
+    # penalises their difference. This forces the model to track the local
+    # trend shape, not just the global episode mean.
+    hw          = DRIFT_WINDOW                          # full window, not half
+    # unfold produces (B, T-hw+1, hw); mean over last dim = rolling mean
+    pred_roll   = pred.unfold(1, hw, 1).mean(dim=-1)    # (B, T-hw+1, 1)
+    target_roll = target.unfold(1, hw, 1).mean(dim=-1)  # (B, T-hw+1, 1)
+    drift_loss  = ((pred_roll - target_roll) ** 2).mean()
 
-    # Bias penalty — episode-level mean correction = mean target
-    bias_penalty = ((pred.mean(dim=1) - target.mean(dim=1))**2).mean()
+    # Bias penalty — episode-level mean correction = mean target.
+    # Kept separate from drift_loss so the two penalties are independently weighted.
+    # drift_loss enforces local shape; bias_penalty enforces global offset.
+    bias_penalty = ((pred.mean(dim=1) - target.mean(dim=1)) ** 2).mean()
+
+    # Slope loss — penalises mismatch between step-to-step rate of change.
+    # pred_slope[t] = pred[t+1] - pred[t]  ≈ d(correction)/dt
+    # target_slope  = d(true_drift)/dt      ≈ the sensor bias rate
+    # MSE of their difference forces the network to match the drift velocity,
+    # not just the drift level. This is the primary mechanism that flattens
+    # the long-term REN error trend relative to the CC trend.
+    pred_slope   = pred[:, 1:, :]   - pred[:, :-1, :]    # (B, T-1, 1)
+    target_slope = target[:, 1:, :] - target[:, :-1, :]  # (B, T-1, 1)
+    slope_loss   = F.mse_loss(pred_slope, target_slope)
+
+    # Pearson loss applied to the full (warmed-up) chunk
+    p_loss = pearson_loss(pred, target)
+    
 
     return (base
             + SMOOTH_WEIGHT       * smooth_loss
             + ZC_WEIGHT           * zc_loss
             + DRIFT_WEIGHT        * drift_loss
             + BIAS_PENALTY_WEIGHT * bias_penalty
-            + TRANSITION_WEIGHT   * transition_loss)
+            + TRANSITION_WEIGHT   * transition_loss
+            + PEARSON_WEIGHT      * p_loss
+            + SLOPE_WEIGHT        * slope_loss
+            )
+def pearson_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Pearson correlation loss over the sequence dimension.
+
+    L = mean over batch of (1 - r(pred_b, target_b))^2
+    where r is the Pearson correlation coefficient.
+
+    A flat constant correction → r=0 → loss=1.0 (maximum penalty).
+    Perfect dynamic tracking  → r=1 → loss=0.0.
+
+    This is the critical loss that breaks the "lazy constant offset"
+    local minimum: the model cannot satisfy this loss by outputting
+    mean(target) — it must actually track the dynamic drift signal.
+
+    Shape: pred and target are (batch, seq, 1).
+    Computed per-batch-element over the seq dimension then averaged.
+    """
+    # Flatten seq and feature dims: (batch, seq)
+    p = pred.squeeze(-1)    # (B, seq)
+    t = target.squeeze(-1)  # (B, seq)
+
+    p_mean = p.mean(dim=1, keepdim=True)
+    t_mean = t.mean(dim=1, keepdim=True)
+    p_c    = p - p_mean
+    t_c    = t - t_mean
+
+    cov    = (p_c * t_c).sum(dim=1)                          # (B,)
+    std_p  = p_c.pow(2).sum(dim=1).sqrt().clamp(min=1e-8)    # (B,)
+    std_t  = t_c.pow(2).sum(dim=1).sqrt().clamp(min=1e-8)    # (B,)
+
+    r = cov / (std_p * std_t)                                # (B,) in [-1, 1]
+    # We want r → 1 (since target = SOC_true - soc_cc, positive correlation is correct)
+    # Penalty = (1 - r)^2 is zero only when r = 1
+    return ((1.0 - r) ** 2).mean()
 
 
 # =============================================================================
