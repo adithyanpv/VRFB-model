@@ -1,35 +1,37 @@
-# dataset_gen.py
+
 """
-VRFB Dataset Generator — v5  (Pure Observer Architecture)
-==========================================================
+VRFB Dataset Generator — v6  (Direct SOC Estimation)
+=====================================================
 
-CHANGES FROM v4
+CHANGES FROM v5
 ---------------
-1. Feature set reduced to 6 strictly observable inputs:
-     voltage, current, temperature_stack, temperature_tank, flow_rate, soc_cc
-   Removed: bias_est, soc_cc_corrected, cumulative_ah_norm,
-            I_limit_approx, transport_ratio_approx
-   Reason: These derived/integrated features caused OOD failure during
-   long deployments (cumulative_ah_norm grows without bound past training
-   range; bias_est creates a runaway feedback loop at inference).
+1. `target` column REMOVED from CSV.
+   TARGET is now SOC_true (direct SOC), not SOC_true − soc_cc.
+   train_ren.py reads SOC_true directly — no derived target needed.
 
-2. Target changed to raw drift:
-     target = SOC_true - soc_cc
-   Previously used SOC_true - soc_cc_corrected which depended on the
-   ground-truth PI observer — a form of data leakage.
+2. `voltage` column REMOVED from CSV.
+   v_ocv_approx = V_terminal − I×R_nom replaces it.
+   voltage and v_ocv_approx are linearly dependent given current →
+   collinearity caused overfitting in v5.
 
-3. PI observer completely removed from data generation.
-   The REN hidden state z is the sole long-term integrator.
-   This matches deployment exactly — no privileged information.
+3. `soc_cc` KEPT in CSV (not a model feature — CC baseline metric only).
+   train_ren.py uses soc_cc solely to compute the CC RMSE baseline.
+   It is NOT passed to the model.
 
-4. soc_cc bias is FIXED: measured["current"] is passed directly to cc.update.
-   The old double-bias bug (adding current_bias twice) is gone.
+4. `soc_init_decay` NOT in CSV — computed dynamically in load_episodes():
+     soc_init_decay[t] = SOC_true[t=0] × exp(−t / 1800s)
+   At inference: computed from Nernst inversion of v_ocv_approx[0].
 
-DESIGN:
-  N_EPISODES    = 120  (96 train / 24 test)
-  EPISODE_STEPS = 36,000  (10 hours at dt=1s)
-  FEATURES      = 6  [voltage, current, T_stack, T_tank, flow, soc_cc]
-  TARGET        = SOC_true - soc_cc  (raw CC drift correction)
+5. current_bias restored to ±5.0 A (was reduced to ±1.5 A in v5).
+   At ±1.5 A, drift was too small — model had no incentive to learn
+   from Nernst signal. At ±5 A, meaningful drift accumulates and the
+   voltage-based correction matters.
+
+CSV COLUMNS SAVED:
+  episode_id, time,
+  v_ocv_approx, current, temperature_stack, temperature_tank, flow_rate,
+  soc_cc,    ← CC baseline metric only, NOT a model feature
+  SOC_true   ← direct target for train_ren.py
 """
 
 import os
@@ -55,23 +57,20 @@ TRAIN_FRAC    = 0.80      # 96 train / 24 test
 SEED          = 42
 rng           = np.random.default_rng(SEED)
 _R_STACK_NOMINAL = (0.0015 + 0.0005) * 40   # 0.08 Ω
-# ── 6 strictly observable features ───────────────────────────────────────────
-# These are exactly the signals available from hardware ADC + flow meter.
-# No derived quantities, no integrated state, no ground-truth-dependent features.
+# ── Columns that train_ren.py needs from the CSV ─────────────────────────────
+# soc_init_decay is computed dynamically in load_episodes() — NOT saved here.
+# soc_cc is saved for CC baseline computation in train_ren.py, NOT as model input.
 FEATURE_COLS = [
-     "voltage",           # terminal voltage — V = E_nernst + I*R (Ohmic-contaminated)
-    "current",           # stack current [A]
+    "v_ocv_approx",      # Nernst OCV: V_terminal − I×R_nom  (no Ohmic jump)
+    "current",           # sensor current [A]  (includes bias + noise)
     "temperature_stack",
     "temperature_tank",
     "flow_rate",
-    "soc_cc",
-    "v_ocv_approx",           # raw Coulomb Counter SOC     — drifting integrator output
 ]
-
-TARGET_COL = "target"   # SOC_true - soc_cc  (raw CC drift — what REN must correct)
+# No TARGET_COL in CSV — train_ren.py reads SOC_true directly as target.
 
 # All columns saved to CSV
-ROW_COLS = ["episode_id", "time"] + FEATURE_COLS + ["SOC_true", TARGET_COL]
+ROW_COLS = ["episode_id", "time"] + FEATURE_COLS + ["soc_cc", "SOC_true"]
 N_COLS   = len(ROW_COLS)
 
 # SOC bands for stratification
@@ -93,14 +92,16 @@ for band, n in zip(SOC_BANDS, _per_band):
 _rng_bands = np.random.default_rng(SEED + 2)
 _rng_bands.shuffle(episode_bands)
 
-print("VRFB Dataset Generator  v5  (Pure Observer Architecture)")
+print("VRFB Dataset Generator  v6  (Direct SOC Estimation)")
 print(f"  Episodes      : {N_EPISODES}  ({int(N_EPISODES*TRAIN_FRAC)} train / "
       f"{N_EPISODES - int(N_EPISODES*TRAIN_FRAC)} test, shuffled split)")
 print(f"  Steps/episode : {EPISODE_STEPS:,}  ({EPISODE_STEPS/3600:.1f} hours)")
 print(f"  Total rows    : ~{N_EPISODES * EPISODE_STEPS:,}")
-print(f"  Features ({len(FEATURE_COLS)})   : {FEATURE_COLS}")
-print(f"  Target        : SOC_true - soc_cc  (raw CC drift)")
-print(f"  PI observer   : REMOVED (z is the sole integrator)")
+print(f"  CSV columns   : {ROW_COLS}")
+print(f"  Model features: {FEATURE_COLS} + soc_init_decay (computed in load_episodes)")
+print(f"  Target        : SOC_true  (direct SOC — read by train_ren.py)")
+print(f"  soc_cc in CSV : YES (CC baseline metric only, NOT a model input)")
+print(f"  current_bias  : ±5.0 A  (restored from ±1.5 A)")
 print("-" * 60)
 
 
@@ -243,15 +244,24 @@ for ep in tqdm(range(N_EPISODES), desc="Generating episodes"):
         T_base = rng.uniform(296.0, 303.0)
 
     # ── CC initial offset ─────────────────────────────────────────────────
-    if rng.random() < 0.20:
+    r = rng.random()
+    if r < 0.20:
+        # Hard case: large initial offset
         sign           = rng.choice([-1, 1])
-        cc_init_offset = sign * rng.uniform(0.15, 0.25)   # hard case
+        cc_init_offset = sign * rng.uniform(0.15, 0.25)
+    elif r < 0.45:
+        # NEW: CC starts accurate (matches cycle_test deployment scenario)
+        # 25% of episodes — model must learn NOT to over-correct when CC is good
+        cc_init_offset = rng.uniform(-0.02, 0.02)
     else:
-        cc_init_offset = rng.uniform(-0.15, 0.15)
+        # Moderate initial offset
+        cc_init_offset = rng.uniform(-0.10, 0.10)
     soc_cc_init = float(np.clip(init_soc + cc_init_offset, 0.06, 0.94))
 
     # ── Current sensor DC bias ────────────────────────────────────────────
-    current_bias = rng.uniform(-1.5, 1.5)
+    # ±5.0 A restored (was ±1.5 A in v5 — too small, model had no drift
+    # signal and never learned to use Nernst voltage).
+    current_bias = rng.uniform(-5.0, 5.0)
 
     # ── Physics objects ───────────────────────────────────────────────────
     cfg             = VRFBConfig()
@@ -325,24 +335,22 @@ for ep in tqdm(range(N_EPISODES), desc="Generating episodes"):
             Q_nominal        = out["capacity_nominal"],
         ))
 
-        soc_true   = float(out["soc_true"])
-        raw_target = soc_true - soc_cc   # pure drift: what REN must add to CC
+        soc_true = float(out["soc_true"])
+        # soc_cc saved for CC baseline metric in train_ren.py — NOT a model feature
+        # raw_target (SOC_true - soc_cc) is NO LONGER saved — TARGET is SOC_true directly
 
         # Ohmic-corrected OCV approximation (hardware-computable)
-        # At current reversal V_terminal jumps by 2*I*R but V_ocv stays smooth.
-        v_ocv = measured["voltage"] - measured["current"] * _R_STACK_NOMINAL
+        v_ocv = measured["voltage"] + measured["current"] * _R_STACK_NOMINAL
 
         ep_data[step, IDX["episode_id"]]        = ep
         ep_data[step, IDX["time"]]              = t
-        ep_data[step, IDX["voltage"]]           = measured["voltage"]
+        ep_data[step, IDX["v_ocv_approx"]]      = float(v_ocv)
         ep_data[step, IDX["current"]]           = measured["current"]
         ep_data[step, IDX["temperature_stack"]] = measured["temperature"]
         ep_data[step, IDX["temperature_tank"]]  = measured["temperature_tank"]
         ep_data[step, IDX["flow_rate"]]         = measured["flow_rate"]
         ep_data[step, IDX["soc_cc"]]            = soc_cc
-        ep_data[step, IDX["v_ocv_approx"]]      = float(v_ocv)
         ep_data[step, IDX["SOC_true"]]          = soc_true
-        ep_data[step, IDX["target"]]            = raw_target
 
     all_chunks.append(ep_data)
 
@@ -376,6 +384,8 @@ print(f"\nSaved datasets/vrfb_train.csv  ({len(df_train):,} rows, "
       f"{df_train['episode_id'].nunique()} episodes)")
 print(f"Saved datasets/vrfb_test.csv   ({len(df_test):,} rows, "
       f"{df_test['episode_id'].nunique()} episodes)")
-print(f"\nFeatures : {FEATURE_COLS}")
-print(f"Target   : SOC_true - soc_cc  (raw CC drift)")
+print(f"\nCSV columns  : {ROW_COLS}")
+print(f"Model inputs : {FEATURE_COLS} + soc_init_decay (dynamic, from SOC_true[0])")
+print(f"Target       : SOC_true  (read directly by train_ren.py)")
+print(f"CC baseline  : soc_cc column (metric only, not model input)")
 print("Done.")

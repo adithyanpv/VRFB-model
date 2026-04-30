@@ -44,6 +44,7 @@ STEPS_PER_TICK = 10
 HISTORY_LEN    = 300
 EMA_TAU_FAST = 30     # used for BMS protection decisions (responsive)
 EMA_TAU_DISP = 120    # used for dashboard display (smooth visual)
+INIT_DECAY_STEPS = 1800.0 
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -163,16 +164,18 @@ class SimulationEngine:
         self._transition_steps = 0
         self._bias_est         = 0.0
         self._cumulative_ah    = 0.0
+        self._init_soc_for_decay = self.cfg.initial_soc  # anchor for soc_init_decay
+        self._decay_step         = 0
 
     def _reset_ren_state(self):
         with torch.no_grad():
             self.z_ren = self.model.z0.detach().clone()
-        self.soc_ren_ema_fast  = self.cfg.initial_soc
-        self.soc_ren_ema_disp  = self.cfg.initial_soc
-        self._prev_bms_mode    = "standby"
-        self._transition_steps = 0
-        self._bias_est         = 0.0
-        self._cumulative_ah    = 0.0
+            self.soc_ren_ema_fast    = self.cfg.initial_soc
+            self.soc_ren_ema_disp    = self.cfg.initial_soc
+            self._prev_bms_mode      = "standby"
+            self._transition_steps   = 0
+            self._decay_step         = 0
+            self._init_soc_for_decay = self.cfg.initial_soc  # use config initial SOC
 
     # ─────────────────────────────────────────────────────────────────────────
     # INTELLIGENT FLOW CONTROLLER (IFC) — Faraday-based optimal flow
@@ -207,9 +210,14 @@ class SimulationEngine:
         I_abs   = abs(self.I_cmd)
         soc_ai  = float(np.clip(self.soc_ren_ema_fast, 0.0, 1.0))
 
+        if self._decay_step < 3600:
+            return 20.0 * self.cfg.LPM_to_m3s 
+
         if I_abs < 1.0:
             # Standby — run at minimum to maintain electrolyte circulation
             return self.IFC_Q_MIN_LPM * self.cfg.LPM_to_m3s
+        
+        
 
         # Determine which reactant is being consumed
         if self.I_cmd > 0:
@@ -269,37 +277,49 @@ class SimulationEngine:
 
     def _ren_step(self, measured: dict, soc_cc: float) -> float:
         """
-        9-feature PI-observer hybrid inference.
+        Direct SOC inference — v6.
 
-        Features: voltage, current, T_stack, T_tank, flow,
-                  soc_cc_corrected, transport_ratio_approx,
-                  bias_est, cumulative_ah_norm
+        Features (6): v_ocv_approx, current, T_stack, T_tank, flow_rate, soc_init_decay
+        soc_cc is NOT a feature — it is passed in only to be available if needed elsewhere.
 
-        Bias integrator (PI observer):
-          At deployment, the true SOC is unknown, so we use the REN correction
-          from the previous step as the innovation signal for the bias integrator.
-          This is the separation principle: integrator handles the ramp component,
-          REN handles the stationary residual.
+        soc_init_decay = _init_soc_for_decay * exp(-_decay_step / INIT_DECAY_STEPS)
+        _init_soc_for_decay is reset to the Nernst-estimated SOC at every BMS mode
+        transition (standby→charge, standby→discharge) so the prior is always fresh.
 
-          bias_est_{t+1} = bias_est_t + ALPHA_BIAS * (prev_correction - bias_est_t)
-          soc_cc_corrected = clip(soc_cc + bias_est, 0, 1)
+        Returns: direct SOC estimate in [0, 1] — NOT soc_cc + correction.
         """
+        import math
+
         I = measured["current"]
         Q = measured["flow_rate"]
 
-        # Pure observer: 6 features matching train_ren.py FEATURE_COLS exactly.
-        # v_ocv_approx = V_terminal - I*R_nominal removes the Ohmic jump at
-        # current reversals so the model sees the clean Nernst SOC signal.
         _R_STACK = (self.cfg.R_membrane_initial + self.cfg.R_contact) * self.cfg.N_cells
-        v_ocv    = measured["voltage"] - I * _R_STACK
+        # Approximate concentration overpotential correction using flow rate.
+        # At reference flow (20 LPM), this term is zero.
+        # At low flow, adds correction to compensate for larger concentration drop.
+        # At high flow (45 LPM), subtracts slightly to avoid over-correction.
+        # This keeps v_ocv closer to true V_OCV regardless of pump speed.
+        Q_ref        = self._q_ref                          # 20 LPM in m³/s
+        Q_actual     = max(measured["flow_rate"], 1e-6)
+        # Concentration overpotential scales as flow^(-0.4) from vrfb_core.py
+        conc_corr    = 0.008 * ((Q_ref / Q_actual) ** 0.4 - 1.0) * np.sign(I)
+        v_ocv        = measured["voltage"] + I * _R_STACK + conc_corr
+
+        
+        
+
+        soc_init_decay = self._init_soc_for_decay * math.exp(
+            -self._decay_step / INIT_DECAY_STEPS
+        )
+        self._decay_step += 1
 
         x = np.array([[
-            float(v_ocv),               # v_ocv_approx — Nernst signal only
-            I,                          # raw Amps (gate uses this directly)
-            measured["temperature"],    # temperature_stack
+            float(v_ocv),
+            I,
+            measured["temperature"],
             measured["temperature_tank"],
-            Q,                          # flow_rate
-            float(soc_cc),              # raw CC (undrifted label input)
+            Q,
+            float(soc_init_decay),     # replaces soc_cc
         ]], dtype=np.float32)
 
         x_s   = self.scaler.transform(x).astype(np.float32)
@@ -309,9 +329,8 @@ class SimulationEngine:
         with torch.no_grad():
             y_seq, self.z_ren = self.model(x_t, z=self.z_ren, x_raw=I_raw)
 
-        correction = float(y_seq.squeeze())
-        # final_soc = clip(soc_cc + signed_correction, 0, 1)
-        return float(np.clip(float(soc_cc) + correction, 0.0, 1.0))
+        # Direct SOC — model output IS the SOC estimate, not a correction delta
+        return float(np.clip(float(y_seq.squeeze()), 0.0, 1.0))
     # ─────────────────────────────────────────────────────────────────────────
     # SINGLE SIMULATION STEP
     # ─────────────────────────────────────────────────────────────────────────
@@ -370,18 +389,22 @@ class SimulationEngine:
         self._prev_bms_mode = cur_mode
         self._transition_steps += 1
 
-        if self._transition_steps < 60 and cur_mode in ("discharge", "charge"):
-            # Blend raw toward current EMA during transition — suppresses spike
-            blend = self._transition_steps / 60.0   # 0→1 over 60 steps
+        if self._transition_steps < 180 and cur_mode in ("discharge", "charge"):
+            # Extended 3-minute blend — gives model time to converge from OCV
+            # after current reversal. Prevents the charge-onset overshoot.
+            blend = self._transition_steps / 180.0
             raw   = (1.0 - blend) * self.soc_ren_ema_disp + blend * raw
 
         a_fast = 1.0 / EMA_TAU_FAST
         a_disp = 1.0 / EMA_TAU_DISP
-        self.soc_ren_ema_fast = (1.0 - a_fast) * self.soc_ren_ema_fast + a_fast * raw
-        self.soc_ren_ema_disp = (1.0 - a_disp) * self.soc_ren_ema_disp + a_disp * raw
+        if self.bms.mode is BMSMode.STANDBY and self._transition_steps > 60:
+            pass  # hold EMA values — do not update
+        else:
+            self.soc_ren_ema_fast = (1.0 - a_fast) * self.soc_ren_ema_fast + a_fast * raw
+            self.soc_ren_ema_disp = (1.0 - a_disp) * self.soc_ren_ema_disp + a_disp * raw
 
-        soc_ren     = float(np.clip(self.soc_ren_ema_disp, 0.0, 1.0))  # dashboard
-        soc_ren_bms = float(np.clip(self.soc_ren_ema_fast, 0.0, 1.0))  # BMS decisions
+        soc_ren     = float(np.clip(self.soc_ren_ema_disp, 0.0, 1.0))
+        soc_ren_bms = float(np.clip(self.soc_ren_ema_fast, 0.0, 1.0))
         soc_true    = out["soc_true"]
 
         self.step_count += 1

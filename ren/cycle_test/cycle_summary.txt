@@ -1,18 +1,18 @@
 Cycle Test v4 — Pure Observer Architecture
 ============================================================
-Features : ['v_ocv_approx', 'current', 'temperature_stack', 'temperature_tank', 'flow_rate', 'soc_cc']
+Features : ['v_ocv_approx', 'current', 'temperature_stack', 'temperature_tank', 'flow_rate', 'soc_init_decay']
 PI observer : REMOVED
-Gate @ I=0A : 0.000000
+Gate @ I=0A : 0.150000
 CC bias     : 3.00 A
 
 Metric                   CC+REN          CC   Improvement
 --------------------------------------------------------
-RMSE                    0.03581     0.03640         +1.6%
-MAE                     0.03256     0.03321         +2.0%
-Max Err                 0.06086     0.06008         -1.3%
-Bias                   -0.03255    -0.03321           ---
+RMSE                    0.04357     0.03642        -19.6%
+MAE                     0.03349     0.03322         -0.8%
+Max Err                 0.14547     0.06009       -142.1%
+Bias                    0.03344    -0.03322           ---
 
-Cycles improved : 5/5
-Corr(CC_err, correction) : -0.2828  (target -1.0)
-CC RMSE trend  : +0.009759/cycle
-REN RMSE trend : +0.009555/cycle
+Cycles improved : 2/5
+Corr(CC_err, REN-CC) : 0.4183
+CC RMSE trend  : +0.009761/cycle
+REN RMSE trend : +0.001002/cycle

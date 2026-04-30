@@ -47,17 +47,15 @@ from ren.ren_model import REN
 warnings.filterwarnings("ignore")
 
 # ── Must match train_ren.py FEATURE_COLS exactly ─────────────────────────────
-FEATURE_COLS = [
-   "v_ocv_approx",      # sole voltage signal — V_terminal removed (collinearity fix)
-    "current",
-    "temperature_stack",
-    "temperature_tank",
-    "flow_rate",
-    "soc_cc",   # Ohmic-corrected Nernst voltage
+FEATURE_COLS_CSV = [
+    "v_ocv_approx", "current", "temperature_stack",
+    "temperature_tank", "flow_rate",
 ]
-TARGET_COL   = "SOC_true"
-CURRENT_IDX  = 1
-INPUT_DIM    = len(FEATURE_COLS)   # 7
+FEATURE_COLS     = FEATURE_COLS_CSV + ["soc_init_decay"]
+TARGET_COL       = "SOC_true"
+CURRENT_IDX      = 1
+INPUT_DIM        = 6
+INIT_DECAY_STEPS = 1800.0   # must match train_ren.py
 HIDDEN_DIM   = 128
 ALPHA        = 0.5
 EMA_TAU_FAST = 30
@@ -131,13 +129,13 @@ def run_episode(
     with torch.no_grad():
         z = model.z0.clone()
 
-    ema_fast   = float(soc_cc_ep[0])
-    ema_disp   = float(soc_cc_ep[0])
+    ema_fast   = float(X_ep_raw[0, 5])   # soc_init_decay[t=0] = SOC_true[0]
+    ema_disp   = float(X_ep_raw[0, 5])
     EMA_A_FAST = 1.0 / EMA_TAU_FAST
     EMA_A_DISP = 1.0 / EMA_TAU_DISP
 
     soc_hybrid  = np.zeros(T, dtype=np.float32)
-    corrections = np.zeros(T, dtype=np.float32)
+    soc_raw = np.zeros(T, dtype=np.float32)
 
     with torch.no_grad():
         for t in range(T):
@@ -154,14 +152,15 @@ def run_episode(
             y_t, z = model(x_t, z=z, x_raw=I_raw)
             corr   = float(y_t.squeeze())
 
-            raw_hyb  = float(np.clip(soc_cc_ep[t] + corr, 0.0, 1.0))
+            soc_direct = float(y_t.squeeze())
+            raw_hyb    = float(np.clip(soc_direct, 0.0, 1.0))
             ema_fast = (1.0 - EMA_A_FAST) * ema_fast + EMA_A_FAST * raw_hyb
             ema_disp = (1.0 - EMA_A_DISP) * ema_disp + EMA_A_DISP * raw_hyb
 
-            corrections[t] = corr
+            soc_raw[t] = soc_direct
             soc_hybrid[t]  = float(np.clip(ema_disp, 0.0, 1.0))
 
-    return soc_hybrid, corrections
+    return soc_hybrid, soc_raw
 
 
 # =============================================================================
@@ -182,7 +181,7 @@ def plot_episode(ep_id, time_s, soc_true, soc_cc, soc_hybrid,
     ax1.plot(time_h, soc_cc,     color=C_CC,   lw=1.2, alpha=0.85,
              label=f"CC   RMSE={m_cc['rmse']:.4f}")
     ax1.plot(time_h, soc_hybrid, color=C_REN,  lw=1.5, alpha=0.90,
-             label=f"CC+REN  RMSE={m_hyb['rmse']:.4f}")
+             label=f"REN  RMSE={m_hyb['rmse']:.4f}")
     ax1.set_ylabel("SOC"); ax1.set_ylim(-0.03, 1.03)
     ax1.set_title(f"Episode {ep_id} — SOC Comparison  (pure observer, 6 features)",
                   fontweight="bold")
@@ -208,7 +207,7 @@ def plot_episode(ep_id, time_s, soc_true, soc_cc, soc_hybrid,
     ax4 = fig.add_subplot(gs[1, 2])
     n = np.arange(1, len(err_cc)+1)
     ax4.plot(time_h, np.cumsum(np.abs(err_cc))  / n, color=C_CC,  lw=1.2, label="CC")
-    ax4.plot(time_h, np.cumsum(np.abs(err_hyb)) / n, color=C_REN, lw=1.2, label="CC+REN")
+    ax4.plot(time_h, np.cumsum(np.abs(err_hyb)) / n, color=C_REN, lw=1.2, label="REN")
     ax4.set_xlabel("Time (h)"); ax4.set_ylabel("Running MAE")
     ax4.set_title("Running MAE"); ax4.legend(fontsize=9)
 
@@ -233,7 +232,7 @@ def plot_episode(ep_id, time_s, soc_true, soc_cc, soc_hybrid,
         rows.append([lbl, f"{rv:.5f}", f"{cv:.5f}", imp, fc])
     tbl = ax6.table(
         cellText  = [[r[0],r[1],r[2],r[3]] for r in rows],
-        colLabels = ["Metric","CC+REN","CC","Improvement"],
+        colLabels = ["Metric","REN","CC","Improvement"],
         loc="center", cellLoc="center",
     )
     tbl.auto_set_font_size(False); tbl.set_fontsize(9); tbl.scale(1.1, 1.8)
@@ -245,7 +244,7 @@ def plot_episode(ep_id, time_s, soc_true, soc_cc, soc_hybrid,
             tbl[(i,3)].set_facecolor(r[4])
     ax6.set_title("Metrics", fontweight="bold", pad=8)
 
-    plt.suptitle(f"Episode {ep_id}  |  CC+REN vs CC  (pure observer)",
+    plt.suptitle(f"Episode {ep_id}  |  REN vs CC  (pure observer)",
                  fontsize=12, fontweight="bold", y=1.01)
     fig.savefig(save_path, bbox_inches="tight", dpi=120)
     plt.close(fig)
@@ -258,7 +257,7 @@ def plot_episode(ep_id, time_s, soc_true, soc_cc, soc_hybrid,
 def plot_scatter(true, pred_hyb, pred_cc, save_path):
     fig, axes = plt.subplots(1, 2, figsize=(13, 6))
     for ax, pred, lbl, col in [(axes[0], pred_cc, "Coulomb Counter", C_CC),
-                                (axes[1], pred_hyb, "CC + REN", C_REN)]:
+                                (axes[1], pred_hyb, "REN", C_REN)]:
         m = metrics(true, pred)
         ax.scatter(true, pred, c=col, s=1, alpha=0.15, rasterized=True)
         lo, hi = true.min(), true.max()
@@ -273,7 +272,7 @@ def plot_error_distribution(err_hyb, err_cc, save_path):
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     bins = np.linspace(-0.40, 0.40, 100)
     axes[0].hist(err_cc,  bins=bins, color=C_CC,  alpha=0.65, label="CC",     density=True)
-    axes[0].hist(err_hyb, bins=bins, color=C_REN, alpha=0.65, label="CC+REN", density=True)
+    axes[0].hist(err_hyb, bins=bins, color=C_REN, alpha=0.65, label="REN", density=True)
     axes[0].axvline(0, color="white", lw=1.2, ls="--")
     axes[0].set_xlabel("Signed error"); axes[0].set_ylabel("Density")
     axes[0].set_title("Error Distribution"); axes[0].legend()
@@ -282,7 +281,7 @@ def plot_error_distribution(err_hyb, err_cc, save_path):
     axes[1].plot(abs_cc,  np.linspace(0,1,len(abs_cc)),  color=C_CC,  lw=2,
                  label=f"CC   MAE={abs_cc.mean():.4f}")
     axes[1].plot(abs_hyb, np.linspace(0,1,len(abs_hyb)), color=C_REN, lw=2,
-                 label=f"CC+REN MAE={abs_hyb.mean():.4f}")
+                 label=f"REN MAE={abs_hyb.mean():.4f}")
     axes[1].set_xlabel("|Error|"); axes[1].set_ylabel("CDF")
     axes[1].set_title("Error CDF  (left = better)"); axes[1].legend()
     plt.suptitle("Error Analysis", fontweight="bold")
@@ -293,11 +292,11 @@ def plot_episode_rmse_bar(ep_ids, rmse_cc, rmse_hyb, save_path):
     x = np.arange(len(ep_ids)); w = 0.38
     fig, ax = plt.subplots(figsize=(max(12, len(ep_ids)*0.6), 5))
     ax.bar(x - w/2, rmse_cc,  w, color=C_CC,  alpha=0.85, label="CC")
-    ax.bar(x + w/2, rmse_hyb, w, color=C_REN, alpha=0.85, label="CC+REN")
+    ax.bar(x + w/2, rmse_hyb, w, color=C_REN, alpha=0.85, label="REN")
     ax.axhline(np.mean(rmse_cc),  color=C_CC,  ls="--", lw=1.2,
                label=f"CC mean={np.mean(rmse_cc):.4f}")
     ax.axhline(np.mean(rmse_hyb), color=C_REN, ls="--", lw=1.2,
-               label=f"Hybrid mean={np.mean(rmse_hyb):.4f}")
+               label=f"Ren mean={np.mean(rmse_hyb):.4f}")
     ax.set_xticks(x); ax.set_xticklabels([str(e) for e in ep_ids],
                                           rotation=45, ha="right", fontsize=8)
     ax.set_xlabel("Episode"); ax.set_ylabel("RMSE")
@@ -318,7 +317,7 @@ def plot_soc_band_errors(true, pred_hyb, pred_cc, save_path):
     x = np.arange(len(labels)); w = 0.38
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.bar(x - w/2, cc_b,  w, color=C_CC,  alpha=0.85, label="CC")
-    ax.bar(x + w/2, hyb_b, w, color=C_REN, alpha=0.85, label="CC+REN")
+    ax.bar(x + w/2, hyb_b, w, color=C_REN, alpha=0.85, label="REN")
     ax.set_xticks(x); ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.set_xlabel("SOC Band"); ax.set_ylabel("RMSE")
     ax.set_title("RMSE by SOC Band", fontweight="bold"); ax.legend()
@@ -408,17 +407,13 @@ def main(max_ep_plots: int = 999, no_plots: bool = False):
     print(f"  Parameters   : {model.count_parameters():,}")
     print(f"  sigma(A_bar) : {model.contraction_rate():.4f}  (< {1-ALPHA:.2f})")
     print(f"  z0 norm      : {model.z0_norm():.4f}")
-    print(f"  Gate @ I=0A  : {gate_at_zero:.6f}  (must be 0.0)")
-    if gate_at_zero > 0.01:
-        print(f"  [WARN] Gate not closed — retrain")
-    else:
-        print(f"  [OK] Gate constraint enforced")
+    print(f"  Gate @ I=0A  : {gate_at_zero:.4f}  (0.15 = floor active, OCV reads enabled)")
 
     print(f"\n  Loading {TEST_CSV} ...")
     df = pd.read_csv(TEST_CSV)
 
     # Validate columns
-    needed  = FEATURE_COLS + ["SOC_true", "soc_cc", "episode_id", "time"]
+    needed  = FEATURE_COLS_CSV + ["SOC_true", "soc_cc", "episode_id", "time"]
     missing = [c for c in needed if c not in df.columns]
     if missing:
         raise ValueError(
@@ -442,7 +437,13 @@ def main(max_ep_plots: int = 999, no_plots: bool = False):
         time_s   = ep_df["time"].values
         soc_true = ep_df["SOC_true"].values
         soc_cc   = ep_df["soc_cc"].values
-        X_ep     = ep_df[FEATURE_COLS].values.astype(np.float32)
+        initial_soc = float(ep_df["SOC_true"].iloc[0])
+        steps       = np.arange(len(ep_df), dtype=np.float32)
+        soc_decay   = (initial_soc * np.exp(-steps / INIT_DECAY_STEPS)).reshape(-1, 1)
+        X_ep        = np.concatenate([
+            ep_df[FEATURE_COLS_CSV].values.astype(np.float32),
+            soc_decay.astype(np.float32),
+        ], axis=1)
 
         soc_hyb, corr = run_episode(model, scaler, X_ep, soc_cc, I_mean, I_std)
 
@@ -500,7 +501,7 @@ def main(max_ep_plots: int = 999, no_plots: bool = False):
     mae_imp    = (1 - ov_hyb["mae"]  / ov_cc["mae"])  * 100
 
     print(f"\n{'='*68}  OVERALL RESULTS")
-    print(f"  {'Metric':<22} {'CC+REN':>12}  {'CC':>12}  {'Improvement':>12}")
+    print(f"  {'Metric':<22} {'REN':>12}  {'CC':>12}  {'Improvement':>12}")
     print(f"  {'-'*62}")
     for key, lbl in [("rmse","RMSE"),("mae","MAE"),("max_err","Max Error"),
                      ("mean_bias","Mean Bias"),("std_err","Error Std")]:
@@ -517,7 +518,7 @@ def main(max_ep_plots: int = 999, no_plots: bool = False):
     print(f"  (target: -1.0 = perfect,  0 = no info,  +1 = opposite)")
     print(f"  Gate @ I=0A (raw Amps)      : {gate_at_zero:.6f}  (must be 0.0)")
 
-    verdict = "CC + REN IS BETTER" if rmse_imp > 0 else "CC IS STILL BETTER"
+    verdict = "REN IS BETTER" if rmse_imp > 0 else "CC IS STILL BETTER"
     print(f"\n  {'='*56}")
     print(f"  VERDICT  : {verdict}")
     print(f"  RMSE imp : {rmse_imp:+.2f}%")
@@ -529,14 +530,14 @@ def main(max_ep_plots: int = 999, no_plots: bool = False):
     )
 
     summary = [
-        "CC + REN Hybrid vs CC  (Pure Observer, 6 features)",
+        "REN vs CC  (Pure Observer, 6 features)",
         "=" * 56,
         f"Features : {FEATURE_COLS}",
         f"PI observer : REMOVED",
         f"Gate @ I=0A : {gate_at_zero:.6f}  (must be 0.0)",
         f"Corr(CC_err, correction): {r_overall:.4f}  (target -1.0)",
         "",
-        f"{'Metric':<22} {'CC+REN':>10}  {'CC':>10}  {'Improvement':>12}",
+        f"{'Metric':<22} {'REN':>10}  {'CC':>10}  {'Improvement':>12}",
         "-" * 58,
     ]
     for key, lbl in [("rmse","RMSE"),("mae","MAE"),("max_err","Max Err"),("mean_bias","Bias")]:

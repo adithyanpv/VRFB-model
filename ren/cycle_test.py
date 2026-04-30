@@ -58,12 +58,13 @@ EMA_TAU_FAST = 30
 EMA_TAU_DISP = 120
 CURRENT_IDX  = 1
 
-# 6 strictly observable features — must match train_ren.py exactly
+# REMOVE the entire FEATURE_COLS block and replace with:
 _R_STACK_NOMINAL = (0.0015 + 0.0005) * 40   # 0.08 Ω — from config.py
+INIT_DECAY_STEPS = 1800.0   # 30-min decay constant — must match train_ren.py
 
 FEATURE_COLS = [
     "v_ocv_approx", "current", "temperature_stack",
-    "temperature_tank", "flow_rate", "soc_cc",
+    "temperature_tank", "flow_rate", "soc_init_decay",
 ]
 DEVICE = torch.device("cpu")
 C_TRUE = "#00e5ff"
@@ -164,7 +165,7 @@ def run_cycle_test(args):
     with open(SCALER_PATH, "rb") as f:
         scaler = pickle.load(f)
 
-    print(f"\n  Gate @ I=0A  : {model.gate_value_at_raw_amps(0.0):.6f}  (must be 0.0)")
+    print(f"  Gate @ I=0A  : {model.gate_value_at_raw_amps(0.0):.4f}  (0.15 = floor active)")
     print(f"  Gate @ {args.current:.0f}A : {model.gate_value_at_raw_amps(args.current):.4f}")
 
     # Physics objects
@@ -182,6 +183,8 @@ def run_cycle_test(args):
     # REN state — no PI observer state needed
     with torch.no_grad():
         z_ren = model.z0.detach().clone()
+    _init_soc_for_decay = float(args.soc_high)  # reset at each half-cycle start
+    
     ema_fast   = float(args.soc_high)
     ema_disp   = float(args.soc_high)
     EMA_A_FAST = 1.0 / EMA_TAU_FAST
@@ -220,14 +223,16 @@ def run_cycle_test(args):
         measured = sensor.measure(out)
         soc_cc   = float(cc.update(measured["current"], dt, out["capacity_nominal"]))
 
-        v_ocv = measured["voltage"] - measured["current"] * _R_STACK_NOMINAL
+        v_ocv = measured["voltage"] + measured["current"] * _R_STACK_NOMINAL
+        soc_decay = _init_soc_for_decay * math.exp(-step / INIT_DECAY_STEPS)
+
         x = np.array([[
-            float(v_ocv),               # v_ocv_approx — sole voltage signal
+            float(v_ocv),
             measured["current"],
             measured["temperature"],
             measured["temperature_tank"],
             measured["flow_rate"],
-            soc_cc,
+            float(soc_decay),          # soc_init_decay — NOT soc_cc
         ]], dtype=np.float32)
 
         x_s   = scaler.transform(x).astype(np.float32)
@@ -236,10 +241,11 @@ def run_cycle_test(args):
 
         with torch.no_grad():
             y_t, z_ren = model(x_t, z=z_ren, x_raw=I_raw)
+        
+        soc_direct = float(y_t.squeeze())          # model output IS the SOC
+        raw_hyb    = float(np.clip(soc_direct, 0.0, 1.0))
 
-        corr    = float(y_t.squeeze())
-        raw_hyb = float(np.clip(soc_cc + corr, 0.0, 1.0))
-
+        
         # Dual EMA
         ema_fast = (1.0 - EMA_A_FAST) * ema_fast + EMA_A_FAST * raw_hyb
         ema_disp = (1.0 - EMA_A_DISP) * ema_disp + EMA_A_DISP * raw_hyb
@@ -256,7 +262,7 @@ def run_cycle_test(args):
             "soc_true"   : out["soc_true"],
             "soc_cc"     : soc_cc,
             "soc_ren"    : soc_ren,
-            "correction" : corr,
+            "correction" : soc_direct,
             "err_cc"     : soc_cc  - out["soc_true"],
             "abs_err_cc" : abs(soc_cc  - out["soc_true"]),
             "abs_err_ren": abs(soc_ren - out["soc_true"]),
@@ -466,7 +472,7 @@ def main():
     args = parser.parse_args()
 
     print(f"\n{'='*64}")
-    print(f"  Continuous Cycle Test v4  (Pure Observer)")
+    print(f"  Continuous Cycle Test v6  (Direct SOC)")
     print(f"{'='*64}")
     print(f"  Cycles        : {args.cycles}")
     print(f"  Current       : {args.current:.0f} A")
@@ -496,7 +502,7 @@ def main():
     print(f"  CC+REN RMSE={ovr['rmse']:.5f}  MAE={ovr['mae']:.5f}  bias={ovr['mean_bias']:+.5f}")
     print(f"  RMSE improvement : {(1-ovr['rmse']/ov['rmse'])*100:+.1f}%")
     print(f"  Cycles improved  : {n_improved}/{n}")
-    print(f"  Corr(CC_err,corr): {info['r']:.4f}  (target -1.0)")
+    print(f"  Corr(CC_err, REN-CC): {info['r']:.4f}  (+0.5=shortcut, near 0=good estimator)")
     print(f"  CC trend         : {info['cc_trend']:+.6f}/cycle")
     print(f"  REN trend        : {info['ren_trend']:+.6f}/cycle")
     if info["cc_trend"] > 0.0002:
@@ -525,7 +531,7 @@ def main():
         lines.append(f"{lbl:<20} {rv:>10.5f}  {cv:>10.5f}  {imp:>12}")
     lines += [
         "", f"Cycles improved : {n_improved}/{n}",
-        f"Corr(CC_err, correction) : {info['r']:.4f}  (target -1.0)",
+        f"Corr(CC_err, REN-CC) : {info['r']:.4f}",
         f"CC RMSE trend  : {info['cc_trend']:+.6f}/cycle",
         f"REN RMSE trend : {info['ren_trend']:+.6f}/cycle",
     ]

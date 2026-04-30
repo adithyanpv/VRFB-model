@@ -13,21 +13,24 @@ Key constraints
      y_t = C(z_next) + D.bias
      Prevents raw sensor noise reaching output per-step.
 
-  3. Current-gated hidden state (use_current_gate=True default)
-     PHYSICS CONSTRAINT: dSOC/dt = 0 when I = 0  (Faraday's law)
+  3. Current-gated hidden state with floor (use_current_gate=True default)
+     PHYSICS CONSTRAINT: SOC changes slowly at I=0 (Faraday's law), but
+     OCV at rest IS the strongest SOC signal (pure Nernst, no Ohmic drop).
 
-     gate = tanh(gate_k * |I_raw| / I_max)
+     gate = GATE_FLOOR + (1 - GATE_FLOOR) * tanh(gate_k * |I_raw| / I_max)
      z_next = gate * z_candidate + (1 - gate) * z
 
-     CRITICAL: gate uses RAW AMPS (x_raw argument), NOT scaled current.
-     StandardScaler shifts I by its mean, so scaled I=0A is NOT zero.
-     Using scaled current as gate input means gate never closes at I=0A,
-     completely breaking the physics constraint.
+     GATE_FLOOR = 0.15: allows 15% state update even at I=0A so the model
+     can read the OCV Nernst signal during BMS standby periods.
+     Without floor: gate=0 at I=0 → z frozen → flat dashboard output.
+     With floor:    gate=0.15 at I=0 → z updates slowly from v_ocv_approx.
 
-     x_raw must be passed as raw current in Amps from the caller.
-     Shape: (batch, seq, 1)  — just the current column, in Amps.
-     The caller (train_ren.py, server.py) reconstructs raw Amps from
-     scaled values using the scaler's mean and std before calling forward().
+     Gate values:
+       I=0A   → gate = 0.15  (OCV integration at rest)
+       I=46A  → gate ≈ 0.94  (near-full update during active operation)
+       I=100A → gate ≈ 0.99
+
+     CRITICAL: gate still uses RAW AMPS (x_raw), NOT scaled current.
 
   4. A_bar cached at eval time — cleared on model.train().
 
@@ -42,6 +45,13 @@ import torch.nn.functional as F
 
 # I_max used to normalise raw Amps into gate — must match config.py I_max
 I_MAX = 200.0
+
+# Gate floor for direct SOC estimation.
+# At I=0A (BMS standby/rest), OCV encodes SOC via Nernst with no Ohmic
+# contamination — it is the strongest available SOC signal.
+# Without floor: gate=0 → z frozen → model cannot read OCV → flat output.
+# With floor=0.15: z updates at 15% rate → converges from OCV in ~10 steps.
+GATE_FLOOR = 0.15
 
 
 class REN(nn.Module):
@@ -173,12 +183,16 @@ class REN(nn.Module):
         """
         One REN timestep with current-gated hidden state update.
 
-        Physics guarantee when use_current_gate=True and I_raw_t is provided:
-          I = 0A  →  gate = tanh(gate_k * 0) = 0  →  z_next = z
-                  →  y_t unchanged  →  dSOC/dt = 0  ✓
+        Gate with floor for direct SOC estimation:
+          gate = GATE_FLOOR + (1-GATE_FLOOR) * tanh(gate_k * |I_raw| / I_MAX)
 
-        If I_raw_t is None (fallback), gate uses scaled current — the
-        gate will NOT close at true I=0A. Always provide I_raw_t.
+          I=0A  → gate = GATE_FLOOR = 0.15
+                → z updates at 15% rate from OCV signal  ✓ (Nernst readable)
+          I>0A  → gate → 1.0  (full update during charge/discharge)
+
+        If I_raw_t is None (fallback), gate uses scaled current — the gate
+        floor still applies but the exact zero-current value is wrong.
+        Always provide I_raw_t.
         """
         pre    = z @ A_bar.t() + self.B(x_t) + self.b_z
         z_cand = torch.tanh(self.ln_z(pre))
@@ -196,7 +210,12 @@ class REN(nn.Module):
                 # This path should never be reached in normal operation.
                 I_abs = x_t[:, self.current_feat_idx:self.current_feat_idx + 1].abs()
 
-            gate   = torch.tanh(self.gate_k.abs() * I_abs)   # (batch, 1)
+            # Gate with floor: GATE_FLOOR + (1-GATE_FLOOR)*tanh(gate_k*|I|/I_MAX)
+            # At I=0A: gate = 0.15  (allows OCV-based SOC update during standby)
+            # At I>>0: gate → 1.0   (full hidden state update during operation)
+            gate   = GATE_FLOOR + (1.0 - GATE_FLOOR) * torch.tanh(
+                self.gate_k.abs() * I_abs
+            )   # (batch, 1)
             z_next = gate * z_cand + (1.0 - gate) * z
         else:
             z_next = z_cand
@@ -313,11 +332,14 @@ class REN(nn.Module):
     def gate_value_at_raw_amps(self, I_amps: float) -> float:
         """
         Gate value for a given raw current in Amps.
-        This is the correct diagnostic — not scaled units.
-        gate_value_at_raw_amps(0.0) must be << 0.1 for constraint to hold.
+        With GATE_FLOOR=0.15:
+          gate_value_at_raw_amps(0.0) = 0.15  (not 0.0 — floor allows OCV reads)
+          gate_value_at_raw_amps(46)  ≈ 0.94
+          gate_value_at_raw_amps(150) ≈ 0.999
         """
         I_norm = abs(I_amps) / I_MAX
-        return torch.tanh(self.gate_k.abs() * torch.tensor(I_norm)).item()
+        raw    = torch.tanh(self.gate_k.abs() * torch.tensor(I_norm))
+        return float(GATE_FLOOR + (1.0 - GATE_FLOOR) * raw)
 
     @torch.no_grad()
     def gate_value_at(self, I_scaled_abs: float) -> float:

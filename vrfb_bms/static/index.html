@@ -529,8 +529,8 @@ body::after {
     <div class="control-group">
       <div class="ctrl-label">Current Command (A) — (+) discharge / (−) charge</div>
       <div class="ctrl-row">
-        <input type="range" class="ctrl-slider" id="sliderI" min="-200" max="200" step="5" value="120">
-        <div class="ctrl-val" id="valI">120 A</div>
+        <input type="range" class="ctrl-slider" id="sliderI" min="-200" max="200" step="5" value="0">
+        <div class="ctrl-val" id="valI">0 A</div>
       </div>
       <div class="ctrl-row">
         <button class="btn dis"    onclick="setPreset(120)">DISCHARGE 120A</button>
@@ -696,6 +696,7 @@ function connect() {
   ws.onopen    = () => {
     document.getElementById('connDot').classList.add('live');
     document.getElementById('connLabel').textContent = 'LIVE';
+    sendControl({ I_cmd: 0, flow_lpm: 20 });
   };
   ws.onclose   = () => {
     document.getElementById('connDot').classList.remove('live');

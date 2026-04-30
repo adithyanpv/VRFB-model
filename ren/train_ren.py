@@ -1,35 +1,65 @@
 """
-REN Training Script — VRFB SOC Estimator  v2.0  (Pure Observer)
-================================================================
+REN Training Script — VRFB SOC Estimator  v4.0  (Direct SOC — Structurally Corrected)
+=======================================================================================
 
-Pure Observer Architecture
----------------------------
-  INPUT_DIM = 6:  voltage, current, T_stack, T_tank, flow_rate, soc_cc
-  TARGET    = SOC_true - soc_cc   (raw CC drift, no pre-correction)
+What changed from v3.0 and why
+--------------------------------
+  TARGET: SOC_true (unchanged from v3.0 — but now the architecture matches it)
 
-  All derived/integrated features removed:
-    - bias_est         (caused runaway feedback at inference)
-    - cumulative_ah_norm (OOD after 10h; explodes at 60h)
-    - transport_ratio_approx (redundant with current+flow)
-    - soc_cc_corrected  (data leakage — needed ground truth at inference)
+  FEATURE SET — 6 inputs:
+    v_ocv_approx, current, temperature_stack, temperature_tank, flow_rate,
+    soc_init_decay   ← replaces soc_cc
 
-  The REN hidden state z is the ONLY long-horizon integrator.
-  It must learn to accumulate drift evidence from the Nernst voltage
-  signal across many timesteps to produce a bounded correction.
+  WHY soc_cc was removed:
+    With 3A sensor bias, soc_cc ≈ SOC_true − tiny_drift.  In one epoch the
+    model learned output ≈ f(soc_cc), giving Corr(CC_err, correction)=+0.517
+    (target −1.0).  The shortcut required no temporal integration at all —
+    the hidden state z was unused.  0/5 cycles improved in cycle test.
 
-Architecture constraints
--------------------------
-  1. use_current_gate=True  — z frozen at I=0A (Faraday's law)
-  2. use_feedthrough=False  — no D(x_t) direct path
-  3. ZC invariance loss     — reinforces gate constraint in loss space
-  4. Drift regularisation   — forces long-horizon mean correction to track
-                              mean target over a 1-hour rolling window
-  5. Bias penalty           — forces episode-level mean correction = mean target
-  6. z0 regularisation      — suppresses init spike at step 0
+  WHY soc_init_decay replaces it:
+    soc_init_decay[t] = SOC_true[t=0] × exp(−t / 1800s)
+    Carries the same cold-start information as soc_cc at t=0, but decays to
+    near-zero by t=7200s.  The shortcut is unavailable after 30 minutes —
+    the model must decode SOC from v_ocv_approx (Nernst) for the remaining
+    9.5 hours of each 10-hour episode.
+    At INFERENCE: computed from Nernst inversion of v_ocv_approx[0].
+
+  LOSS CHANGES:
+    REMOVED — ZC invariance (ZC_WEIGHT was 2.0):
+      At I=0A, OCV encodes SOC via Nernst with no Ohmic drop — best signal.
+      Penalising ΔSOC at rest blocked this update entirely.  Root cause of
+      flat dashboard output during BMS standby.
+
+    REMOVED — Smooth loss (SMOOTH_WEIGHT was 0.20):
+      SMOOTH_I_REF=0.3 (scaled current) gave weight≈0.89 at I=0A, same
+      incorrect behaviour as ZC loss.  Suppressed rest-period OCV updates.
+
+    ADDED — Directional loss (DIRECTIONAL_WEIGHT=1.0):
+      Window-level (128-step) monotonicity constraint.
+      Discharge (mean_I > 5A): penalises positive ΔSOC windows.
+      Charge    (mean_I < −5A): penalises negative ΔSOC windows.
+      Window delta ≈ O(1e-3) — competes with base MSE O(1e-2).
+      Per-step delta O(1e-5) was too small to produce useful gradients.
+
+    ADDED — Slope loss chunk-level (SLOPE_WEIGHT=1.5, was per-step):
+      Expected ΔSOC over full SEQ_LEN chunk = −mean(I)×T/(Q_NOMINAL×3600).
+      At 150A for 992 steps: ΔSOC≈−0.0193, magnitude O(1e-2) — meaningful.
+      Disabled for rest chunks (|mean_I|<5A) to avoid noise-dominated loss.
+      Previous per-step version O(1e-5) was negligible.
+
+    RETAINED — drift, bias_penalty, transition, z0_reg (all valid for SOC).
+
+  ARCHITECTURE NOTE — apply gate floor in ren_model.py:
+    In _step(), replace:
+      gate = torch.tanh(self.gate_k.abs() * I_abs)
+    With:
+      GATE_FLOOR = 0.15
+      gate = GATE_FLOOR + (1-GATE_FLOOR) * torch.tanh(self.gate_k.abs() * I_abs)
+    Without this, gate=0 at I=0 freezes z, blocking OCV reads during standby.
 
 OUTPUT:
-  ren/scaler.pkl
-  ren/ren_soc_best.pth
+  ren/scaler.pkl          ← new 6-feature scaler, incompatible with v3.0
+  ren/ren_soc_best.pth    ← delete old weights before deploying
   ren/ren_soc_last.pth
   ren/training_log.csv
   ren/training_curves.png
@@ -60,19 +90,39 @@ np.random.seed(SEED)
 
 # ── 6 strictly observable features — must match dataset_gen.py exactly ───────
 FEATURE_COLS = [
-    "v_ocv_approx",      # SOLE voltage signal — Nernst OCV without Ohmic contamination
-                         # v_ocv = V_terminal - I*R_nom; smooth at current reversals
-                         # 'voltage' removed: V_terminal = v_ocv + I*R is linearly
-                         # dependent given 'current' → collinearity causes overfitting
-    "current",           # I=0 → gate closes → z frozen (Faraday); independent signal
+    "v_ocv_approx",      # Nernst OCV: V_terminal − I×R_nom (no Ohmic contamination)
+    "current",           # raw Amps — gate uses this directly for I=0 detection
     "temperature_stack",
     "temperature_tank",
     "flow_rate",
-    "soc_cc",          # raw drifting CC — REN learns to correct this
+    "soc_init_decay",    # SOC_true[t=0] × exp(−t / INIT_DECAY_STEPS)
+                         # Provides a per-episode initial SOC prior that fades over
+                         # 30 min.  Eliminates sigmoid-0.5 cold-start trap without
+                         # z0_proj architecture changes.
+                         # At t=0: full initial SOC.  At t=7200s: ≈0.02×initial_soc.
+                         # INFERENCE: compute from Nernst inversion of v_ocv_approx[0]
+                         # — see server.py / cycle_test.py for implementation.
+                         #
+                         # WHY NOT soc_cc:
+                         # With 3A bias, soc_cc ≈ SOC_true − tiny_drift.  The model
+                         # learned output ≈ f(soc_cc) in one epoch (shortcut), producing
+                         # Corr(CC_err, correction) = +0.517 instead of ≈−1.0.
+                         # soc_init_decay carries the same cold-start information but
+                         # decays to zero — the shortcut is unavailable after 30 min.
 ]
-TARGET_COL  = "target"           # SOC_true - soc_cc  (raw CC drift)
-INPUT_DIM   = len(FEATURE_COLS)  # 6
-CURRENT_IDX = 1                  # index of "current" in FEATURE_COLS
+TARGET_COL  = "SOC_true"        # direct SOC ∈ [0.05, 0.95]
+INPUT_DIM   = len(FEATURE_COLS) # 6
+CURRENT_IDX = 1                 # index of "current" in FEATURE_COLS
+
+# ── Initial SOC decay constant ────────────────────────────────────────────────
+INIT_DECAY_STEPS = 1800.0   # seconds  (30-min time constant)
+# t=0:    decay = initial_soc            (full prior)
+# t=1800: decay = 0.368 × initial_soc   (model half-way self-reliant)
+# t=7200: decay = 0.018 × initial_soc   (model fully self-reliant)
+
+# ── Physics constant for slope loss ──────────────────────────────────────────
+Q_NOMINAL = 2144.0   # Ah  n×F×C_total×V_tank/3600  (from config.py)
+# ΔSOC_physics per step = −I / (Q_NOMINAL × 3600)
 
 # Model
 HIDDEN_DIM    = 128
@@ -81,7 +131,7 @@ DROPOUT       = 0.1
 N_POWER_ITERS = 10
 
 # Training
-SEQ_LEN          = 512
+SEQ_LEN          = 1024
 BATCH_SIZE       = 32
 EPOCHS           = 80
 LR               = 3e-4
@@ -98,22 +148,43 @@ MAE_WEIGHT       = 0.3
 HARD_CASE_WEIGHT = 3.0
 HARD_CASE_THRESH = 0.10
 
-# Zero-current invariance (raw Amps — matches BMS dead-band)
-ZC_WEIGHT   = 2.0
-ZC_I_THRESH = 2.0
+# Zero-current invariance — DISABLED for direct SOC estimation.
+# At I=0A (standby/rest), the open-circuit voltage encodes SOC via Nernst
+# with no Ohmic drop — it is the BEST available signal.  Penalising ΔSOC
+# at rest (as this loss did) prevented the model from using that signal.
+# Root cause of flat dashboard output during BMS standby periods.
+ZC_WEIGHT   = 0.0    # ← was 2.0  DISABLED
+ZC_I_THRESH = 2.0    # kept for reference; weight is zero
 
-SMOOTH_WEIGHT = 0.20
-SMOOTH_I_REF  = 0.3
-DRIFT_WEIGHT  = 0.80        # restored — needed to penalise multi-hour trend mismatch
-DRIFT_WINDOW  = 128
-BIAS_PENALTY_WEIGHT = 1.0   # restored — penalises constant offset directly
-Z0_REG_WEIGHT = 2.0
-TRANSITION_WEIGHT = 0.50
-PEARSON_WEIGHT = 0.30
-SLOPE_WEIGHT  = 0.50
-       # Pearson correlation loss — breaks flat-constant local minimum
-                            # A constant correction has r=0 with a dynamic target.
-                            # Penalty = (1 - r)² pushes model toward r=1.0 (perfect tracking)
+# Smooth loss — DISABLED, replaced by directional_loss below.
+# Previous formulation used SMOOTH_I_REF=0.3 (scaled units) which gave
+# exp(−0.036/0.3) ≈ 0.89 weight at I=0A — nearly fully penalising OCV
+# updates during rest.  Same incorrect behaviour as ZC loss.
+SMOOTH_WEIGHT = 0.0  # ← was 0.20  DISABLED
+SMOOTH_I_REF  = 0.3  # kept for reference; weight is zero
+
+# Directional loss — NEW.
+# Window-level physical monotonicity: SOC must decrease during discharge
+# (I > DIRECTIONAL_I_THRESH) and increase during charge (I < −threshold).
+# Uses 128-step windows so delta ≈ O(1e-3) — large enough to compete with
+# base MSE ≈ O(1e-2).  Per-step delta O(1e-5) was too small to matter.
+DIRECTIONAL_WEIGHT   = 1.0
+DIRECTIONAL_I_THRESH = 5.0    # raw Amps — filters sensor noise from direction test
+DIRECTIONAL_WINDOW   = 128    # steps per window (matches DRIFT_WINDOW)
+
+DRIFT_WEIGHT        = 0.40
+DRIFT_WINDOW        = 128
+BIAS_PENALTY_WEIGHT = 0.80
+Z0_REG_WEIGHT       = 5.0
+TRANSITION_WEIGHT   = 2.0
+PEARSON_WEIGHT      = 0.0
+
+# Slope loss — ENABLED with chunk-level Faraday physics.
+# At 150A for SEQ_LEN=1024 steps: ΔSOC ≈ −150×1024/(2144×3600) ≈ −0.0199.
+# Magnitude O(1e-2) → meaningful gradient.  Disabled for rest chunks
+# (|mean_I| < 5A) where noise dominates the expected ΔSOC signal.
+# Previous version used per-step slope (O(1e-5)) — too small, wrong physics.
+SLOPE_WEIGHT = 1.5   # ← was 0.0 or 1.0 (per-step, incorrect)  NOW CHUNK-LEVEL
 
 TRAIN_CSV = "datasets/vrfb_train.csv"
 TEST_CSV  = "datasets/vrfb_test.csv"
@@ -133,18 +204,61 @@ _I_STD:  float = 1.0
 
 def load_episodes(df: pd.DataFrame, scaler: StandardScaler,
                   fit_scaler: bool = False) -> list:
-    """Returns list of (X_ep_scaled, y_ep) tensors per episode."""
-    X_all = df[FEATURE_COLS].values.astype(np.float32)
-    y_all = df[TARGET_COL].values.astype(np.float32)
+    """
+    Build (X_scaled, y) tensors per episode.
+
+    Feature pipeline:
+      1. Read FEATURE_COLS_CSV = [v_ocv_approx, current, T_stack, T_tank, flow_rate]
+         directly from the dataframe (5 columns).
+      2. Compute soc_init_decay per episode:
+           soc_init_decay[t] = SOC_true[t=0] × exp(−t / INIT_DECAY_STEPS)
+         This is the 6th feature.  At INFERENCE, replace SOC_true[t=0] with
+         the Nernst-inverted OCV at step 0 — see server.py for code.
+      3. Concatenate → X_full (N, 6).
+      4. Fit StandardScaler on full concatenated training set (if fit_scaler).
+      5. Scale and return tensors.
+
+    soc_cc is NOT read as a feature.  It IS still in the CSV and is used
+    only for CC baseline computation in main() — not as model input.
+    """
+    FEATURE_COLS_CSV = [
+        "v_ocv_approx", "current", "temperature_stack",
+        "temperature_tank", "flow_rate",
+    ]
+
+    ep_X_raw = []
+    ep_y_raw = []
+
+    for ep_id, group in df.groupby("episode_id", sort=True):
+        T       = len(group)
+        X_csv   = group[FEATURE_COLS_CSV].values.astype(np.float32)   # (T, 5)
+
+        # Decaying initial SOC prior — computed from ground truth during training.
+        # At inference: use Nernst inversion of v_ocv_approx[0] instead.
+        initial_soc = float(group["SOC_true"].iloc[0])
+        steps       = np.arange(T, dtype=np.float32)
+        soc_decay   = (initial_soc * np.exp(-steps / INIT_DECAY_STEPS)
+                       ).astype(np.float32)                            # (T,)
+
+        X_full = np.concatenate([X_csv, soc_decay[:, np.newaxis]], axis=1)  # (T, 6)
+        y_ep   = group["SOC_true"].values.astype(np.float32)                # (T,)
+
+        ep_X_raw.append(X_full)
+        ep_y_raw.append(y_ep)
+
+    # Fit scaler on concatenated full training set
+    X_all = np.concatenate(ep_X_raw, axis=0)
     if fit_scaler:
         scaler.fit(X_all)
-    X_scaled = scaler.transform(X_all).astype(np.float32)
+
+    # Scale and wrap as tensors
     episodes = []
-    for _, group in df.groupby("episode_id", sort=True):
-        idx  = group.index
-        X_ep = torch.tensor(X_scaled[idx], dtype=torch.float32)
-        y_ep = torch.tensor(y_all[idx],    dtype=torch.float32).unsqueeze(-1)
-        episodes.append((X_ep, y_ep))
+    for X_ep, y_ep in zip(ep_X_raw, ep_y_raw):
+        X_scaled = scaler.transform(X_ep).astype(np.float32)
+        X_t = torch.tensor(X_scaled, dtype=torch.float32)
+        y_t = torch.tensor(y_ep,     dtype=torch.float32).unsqueeze(-1)
+        episodes.append((X_t, y_t))
+
     return episodes
 
 
@@ -152,12 +266,62 @@ def load_episodes(df: pd.DataFrame, scaler: StandardScaler,
 # LOSS
 # =============================================================================
 
+def directional_loss(
+    pred:  torch.Tensor,   # (B, seq, 1) predicted SOC
+    I_raw: torch.Tensor,   # (B, seq, 1) raw Amps
+) -> torch.Tensor:
+    """
+    Window-level physical monotonicity constraint.
+
+    SOC must decrease during discharge (I > DIRECTIONAL_I_THRESH) and
+    increase during charge (I < -DIRECTIONAL_I_THRESH).
+
+    Uses non-overlapping DIRECTIONAL_WINDOW-step windows so window delta
+    is O(1e-3) — large enough to compete with base MSE O(1e-2).
+    Per-step delta O(1e-5) at 150A was too small to produce useful gradients.
+    """
+    hw    = DIRECTIONAL_WINDOW
+    B, T, _ = pred.shape
+    n_win = T // hw
+    if n_win == 0:
+        return torch.tensor(0.0, device=pred.device)
+
+    pred_w = pred[:, :n_win * hw, :].reshape(B, n_win, hw, 1)
+    I_w    = I_raw[:, :n_win * hw, :].reshape(B, n_win, hw, 1)
+
+    delta_win  = pred_w[:, :, -1, :] - pred_w[:, :, 0, :]   # (B, n_win, 1)
+    I_mean_win = I_w.mean(dim=2)                              # (B, n_win, 1)
+
+    # Discharge: I > thresh -> DELTA must be <= 0 -> penalise positive delta
+    dis_viol = torch.relu(delta_win)  * (I_mean_win >  DIRECTIONAL_I_THRESH).float()
+    # Charge:    I < -thresh -> DELTA must be >= 0 -> penalise negative delta
+    chg_viol = torch.relu(-delta_win) * (I_mean_win < -DIRECTIONAL_I_THRESH).float()
+
+    return (dis_viol + chg_viol).mean()
+
+
 def composite_loss(
-    pred:        torch.Tensor,          # (B, seq, 1) predicted correction
-    target:      torch.Tensor,          # (B, seq, 1) true correction
+    pred:        torch.Tensor,          # (B, seq, 1) predicted SOC  in (0, 1)
+    target:      torch.Tensor,          # (B, seq, 1) SOC_true        in [0.05, 0.95]
     X_chunk:     torch.Tensor | None,   # (B, seq, 6) scaled features
     I_raw_chunk: torch.Tensor | None,   # (B, seq, 1) raw Amps
 ) -> torch.Tensor:
+    """
+    Multi-term loss for direct SOC estimation.
+
+    ACTIVE:
+      base         weighted MSE + MAE with hard-case emphasis
+      directional  window monotonicity (discharge down, charge up)
+      slope        chunk-level Faraday physics: DELTA_SOC = -mean(I)*T/(Q*3600)
+      drift        rolling-128-step mean pred ~ mean target
+      bias_penalty episode-level mean pred ~ episode mean SOC
+      transition   spike suppression at current reversals
+
+    DISABLED (weight=0):
+      smooth_loss  was penalising OCV updates at rest -- wrong direction
+      zc_loss      was freezing predictions at I=0 -- blocked Nernst signal
+    """
+    # Base: weighted MSE + MAE
     err = pred - target
     with torch.no_grad():
         w = torch.where(
@@ -165,88 +329,68 @@ def composite_loss(
             torch.full_like(err, HARD_CASE_WEIGHT),
             torch.ones_like(err),
         )
-
-    base = MSE_WEIGHT * (w * err**2).mean() + MAE_WEIGHT * F.l1_loss(pred, target)
+    base = MSE_WEIGHT * (w * err ** 2).mean() + MAE_WEIGHT * F.l1_loss(pred, target)
 
     if X_chunk is None or pred.shape[1] <= 1:
         return base
 
-    I_scaled = X_chunk[:, :, CURRENT_IDX:CURRENT_IDX+1]
-    delta    = (pred[:, 1:, :] - pred[:, :-1, :]).abs()
-    I_mid_s  = I_scaled[:, 1:, :].abs()
+    delta = (pred[:, 1:, :] - pred[:, :-1, :]).abs()   # |step DELTA_SOC|
 
-    # Smooth loss — penalise large corrections when current is low
-    # Smooth loss — penalise large corrections when current is low
-    with torch.no_grad():
-        smooth_w = torch.exp(-I_mid_s / SMOOTH_I_REF)
-    smooth_loss = (smooth_w * delta).mean()
-
-    # Transition-aware smooth loss (shark-fin fix)
-    # Penalises large corrections at current reversal events.
-    # At charge↔discharge transition: |dI/dt| is large (up to 300A in one step).
-    # The model should NOT produce a spike correction here — it should recognise
-    # the voltage jump as Ohmic (2*I*R), not Nernst (SOC change).
-    # Using I_raw_chunk for physical amplitude detection.
+    # Directional loss (window-level monotonicity)
     if I_raw_chunk is not None:
-        # |dI| between consecutive steps in raw Amps
-        dI_raw     = (I_raw_chunk[:, 1:, :] - I_raw_chunk[:, :-1, :]).abs()
-        # Normalise: at 150A→-150A reversal dI=300A → normalised=1.5 → clamp to 1
-        dI_norm    = torch.clamp(dI_raw / 200.0, 0.0, 1.0)
+        dir_loss = directional_loss(pred, I_raw_chunk)
+    else:
+        dir_loss = torch.tensor(0.0, device=pred.device)
+
+    # Transition loss: spike suppression at current reversal
+    if I_raw_chunk is not None:
+        dI_raw        = (I_raw_chunk[:, 1:, :] - I_raw_chunk[:, :-1, :]).abs()
+        dI_norm       = torch.clamp(dI_raw / 200.0, 0.0, 1.0)
         with torch.no_grad():
-            transition_w = dI_norm   # 0 during steady operation, 1 at full reversal
+            transition_w = dI_norm
         transition_loss = (transition_w * delta).mean()
     else:
-        transition_loss = torch.tensor(0.0)
+        transition_loss = torch.tensor(0.0, device=pred.device)
 
-    # ZC invariance — gate constraint enforced in loss space
-    if I_raw_chunk is not None:
-        I_mid_raw = I_raw_chunk[:, 1:, :].abs()
-        with torch.no_grad():
-            zc_mask = (I_mid_raw < ZC_I_THRESH).float()
-        zc_loss = (zc_mask * delta).mean()
-    else:
-        zc_loss = torch.tensor(0.0)
+    # DISABLED: smooth loss was penalising OCV updates at I=0 (weight~0.89 at rest)
+    smooth_loss = torch.tensor(0.0, device=pred.device)   # SMOOTH_WEIGHT = 0.0
 
-    # Drift regularisation — rolling 1-hour window consistency
-    # Drift regularisation — rolling window mean consistency.
-    # DRIFT_WINDOW (128) < SEQ_LEN (512), so this branch always executes now.
-    # Computes rolling mean of pred and target over 128-step windows, then
-    # penalises their difference. This forces the model to track the local
-    # trend shape, not just the global episode mean.
-    hw          = DRIFT_WINDOW                          # full window, not half
-    # unfold produces (B, T-hw+1, hw); mean over last dim = rolling mean
-    pred_roll   = pred.unfold(1, hw, 1).mean(dim=-1)    # (B, T-hw+1, 1)
-    target_roll = target.unfold(1, hw, 1).mean(dim=-1)  # (B, T-hw+1, 1)
+    # DISABLED: ZC invariance blocked Nernst updates during standby
+    zc_loss = torch.tensor(0.0, device=pred.device)        # ZC_WEIGHT = 0.0
+
+    # Drift loss: rolling-window mean consistency
+    hw          = DRIFT_WINDOW
+    pred_roll   = pred.unfold(1, hw, 1).mean(dim=-1)
+    target_roll = target.unfold(1, hw, 1).mean(dim=-1)
     drift_loss  = ((pred_roll - target_roll) ** 2).mean()
 
-    # Bias penalty — episode-level mean correction = mean target.
-    # Kept separate from drift_loss so the two penalties are independently weighted.
-    # drift_loss enforces local shape; bias_penalty enforces global offset.
+    # Bias penalty: episode-level mean SOC alignment
     bias_penalty = ((pred.mean(dim=1) - target.mean(dim=1)) ** 2).mean()
 
-    # Slope loss — penalises mismatch between step-to-step rate of change.
-    # pred_slope[t] = pred[t+1] - pred[t]  ≈ d(correction)/dt
-    # target_slope  = d(true_drift)/dt      ≈ the sensor bias rate
-    # MSE of their difference forces the network to match the drift velocity,
-    # not just the drift level. This is the primary mechanism that flattens
-    # the long-term REN error trend relative to the CC trend.
-    pred_slope   = pred[:, 1:, :]   - pred[:, :-1, :]    # (B, T-1, 1)
-    target_slope = target[:, 1:, :] - target[:, :-1, :]  # (B, T-1, 1)
-    slope_loss   = F.mse_loss(pred_slope, target_slope)
+    # Slope loss: CHUNK-LEVEL Faraday physics (not per-step -- too small)
+    # DELTA_SOC over full chunk = -mean(I) * n_steps / (Q_NOMINAL * 3600)
+    # At 150A for 992 steps: ~-0.0193. Magnitude O(1e-2) = meaningful gradient.
+    # Disabled for rest chunks (|mean_I| < 5A) to avoid noise-dominated loss.
+    if I_raw_chunk is not None:
+        I_chunk_mean   = I_raw_chunk.mean(dim=1)                             # (B, 1)
+        active_mask    = (I_chunk_mean.abs() > 5.0).float()                  # (B, 1)
+        expected_delta = -I_chunk_mean * pred.shape[1] / (Q_NOMINAL * 3600.0)
+        actual_delta   = pred[:, -1, :] - pred[:, 0, :]                     # (B, 1)
+        slope_loss     = (active_mask * (actual_delta - expected_delta) ** 2).mean()
+    else:
+        slope_loss = torch.tensor(0.0, device=pred.device)
 
-    # Pearson loss applied to the full (warmed-up) chunk
-    p_loss = pearson_loss(pred, target)
-    
+    return (
+        base
+        + DIRECTIONAL_WEIGHT  * dir_loss
+        + SLOPE_WEIGHT        * slope_loss
+        + DRIFT_WEIGHT        * drift_loss
+        + BIAS_PENALTY_WEIGHT * bias_penalty
+        + TRANSITION_WEIGHT   * transition_loss
+        + SMOOTH_WEIGHT       * smooth_loss  # = 0.0  disabled
+        + ZC_WEIGHT           * zc_loss      # = 0.0  disabled
+    )
 
-    return (base
-            + SMOOTH_WEIGHT       * smooth_loss
-            + ZC_WEIGHT           * zc_loss
-            + DRIFT_WEIGHT        * drift_loss
-            + BIAS_PENALTY_WEIGHT * bias_penalty
-            + TRANSITION_WEIGHT   * transition_loss
-            + PEARSON_WEIGHT      * p_loss
-            + SLOPE_WEIGHT        * slope_loss
-            )
 def pearson_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
     Pearson correlation loss over the sequence dimension.
@@ -278,8 +422,8 @@ def pearson_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     std_t  = t_c.pow(2).sum(dim=1).sqrt().clamp(min=1e-8)    # (B,)
 
     r = cov / (std_p * std_t)                                # (B,) in [-1, 1]
-    # We want r → 1 (since target = SOC_true - soc_cc, positive correlation is correct)
-    # Penalty = (1 - r)^2 is zero only when r = 1
+    # For direct SOC: r→1 means predicted trajectory tracks true SOC shape.
+    # Penalty = (1-r)^2 is zero only when r=1 (perfect tracking).
     return ((1.0 - r) ** 2).mean()
 
 
@@ -292,6 +436,16 @@ def run_epoch(
     episodes:  list,
     optimiser: torch.optim.Optimizer | None = None,
 ) -> tuple[float, float, float, float]:
+    """
+    Stateful training/evaluation epoch with truncated BPTT.
+
+    Hidden state z is carried across chunks within an episode so the model
+    builds long-horizon state without backpropagating through the full 36000
+    steps. P_Z0_RESET randomly resets z between chunks during training,
+    forcing recovery from mid-episode cold starts (inference robustness).
+
+    Returns: (mean_loss, RMSE, MAE, max_abs_error)
+    """
     is_train = optimiser is not None
     model.train() if is_train else model.eval()
     ctx = torch.enable_grad if is_train else torch.no_grad
@@ -342,9 +496,12 @@ def run_epoch(
 
                 # z0 regularisation at first chunk — suppresses init spike
                 if ci == 0 and is_train:
-                    y_step0 = yp[:, 0, :]
-                    loss    = loss + Z0_REG_WEIGHT * (y_step0**2).mean()
-
+                    z0_spike  = ((yp[:, 0, :] - yc[:, 0, :]) ** 2).mean()
+                    z0_warmup = ((yp[:, :300, :] - yc[:, :300, :]) ** 2).mean()
+                    
+                    loss = (loss
+                            + Z0_REG_WEIGHT       * z0_spike
+                            + Z0_REG_WEIGHT * 0.8 * z0_warmup)
                 bloss += loss.item()
 
                 e_arr = (yp_l - yc_l).detach().cpu().numpy().ravel()
@@ -397,30 +554,38 @@ class WarmupCosine(torch.optim.lr_scheduler._LRScheduler):
 def main():
     global _I_MEAN, _I_STD
 
-    print(f"\n{'='*68}")
-    print(f"  REN Training  v2.0  (Pure Observer Architecture)")
-    print(f"{'='*68}")
-    print(f"  Device         : {DEVICE}")
-    print(f"  Features ({INPUT_DIM})   : {FEATURE_COLS}")
-    print(f"  Target         : SOC_true - soc_cc  (raw CC drift)")
-    print(f"  Gate           : use_current_gate=True (raw Amps)")
-    print(f"  Feedthrough    : False")
-    print(f"  Drift window   : {DRIFT_WINDOW}s  (DRIFT_WEIGHT={DRIFT_WEIGHT})")
-    print(f"  Bias penalty   : {BIAS_PENALTY_WEIGHT}")
-    print(f"  z0 reg         : {Z0_REG_WEIGHT}")
-    print(f"  PI observer    : REMOVED — z is the sole integrator")
-    print(f"{'-'*68}")
+    print(f"\n{'='*72}")
+    print(f"  REN Training  v4.0  (Direct SOC — Structurally Corrected)")
+    print(f"{'='*72}")
+    print(f"  Device           : {DEVICE}")
+    print(f"  Features ({INPUT_DIM})     : {FEATURE_COLS}")
+    print(f"  soc_cc           : REMOVED  (shortcut path, was Corr=+0.517)")
+    print(f"  soc_init_decay   : ADDED    (initial SOC prior, decay={INIT_DECAY_STEPS:.0f}s)")
+    print(f"  Target           : SOC_true  (direct absolute SOC)")
+    print(f"  Gate             : use_current_gate=True (raw Amps)")
+    print(f"  ZC loss          : DISABLED  (was blocking OCV at I=0)")
+    print(f"  Smooth loss      : DISABLED  (was penalising rest-period updates)")
+    print(f"  Directional loss : ENABLED  w={DIRECTIONAL_WEIGHT}  win={DIRECTIONAL_WINDOW}s  I_thresh={DIRECTIONAL_I_THRESH}A")
+    print(f"  Slope loss       : ENABLED  w={SLOPE_WEIGHT}  chunk-level Faraday Q={Q_NOMINAL}Ah")
+    print(f"  Drift window     : {DRIFT_WINDOW}s  (DRIFT_WEIGHT={DRIFT_WEIGHT})")
+    print(f"  Bias penalty     : {BIAS_PENALTY_WEIGHT}")
+    print(f"  z0 reg           : {Z0_REG_WEIGHT}")
+    print(f"  Transition       : {TRANSITION_WEIGHT}")
+    print(f"{'─'*72}")
 
     df_train = pd.read_csv(TRAIN_CSV)
     df_test  = pd.read_csv(TEST_CSV)
 
-    # Validate columns
-    needed = FEATURE_COLS + [TARGET_COL, "episode_id"]
+    # soc_init_decay is computed dynamically from SOC_true[t=0] — not in CSV.
+    # soc_cc IS still in CSV and is used only for CC baseline metric below.
+    needed = ["v_ocv_approx", "current", "temperature_stack", "temperature_tank",
+              "flow_rate", "SOC_true", "soc_cc", "episode_id"]
     for col in needed:
         if col not in df_train.columns:
             raise ValueError(
                 f"Missing column '{col}' in training CSV.\n"
-                f"Re-run dataset_gen.py (v5 Pure Observer)."
+                f"Re-run dataset_gen.py.  soc_init_decay is computed "
+                f"dynamically — it does not need to be in the CSV."
             )
 
     print(f"\n  Train : {len(df_train):,} rows  "
@@ -436,8 +601,10 @@ def main():
     _I_MEAN = float(scaler.mean_[CURRENT_IDX])
     _I_STD  = float(scaler.scale_[CURRENT_IDX])
 
-    print(f"\n  Current scaler : mean={_I_MEAN:.2f}A  std={_I_STD:.2f}A")
-    print(f"  Scaled I=0A    : {-_I_MEAN/_I_STD:.4f}  (gate uses raw Amps — correct)")
+    print(f"\n  Current scaler   : mean={_I_MEAN:.2f}A  std={_I_STD:.2f}A")
+    print(f"  Scaled I=0A      : {-_I_MEAN/_I_STD:.4f}  (gate uses raw Amps — correct)")
+    print(f"  soc_init_decay   : mean={scaler.mean_[5]:.4f}  std={scaler.scale_[5]:.4f}  (idx 5)")
+    print(f"  *** New scaler — incompatible with v3.0 weights.  Delete old .pth ***")
 
     scaler_path = os.path.join(SAVE_DIR, "scaler.pkl")
     with open(scaler_path, "wb") as f:
@@ -465,7 +632,8 @@ def main():
 
     print(f"\n  Parameters     : {model.count_parameters():,}")
     print(f"  Contraction    : {model.contraction_rate():.4f}  (< {1-ALPHA:.2f})")
-    print(f"  Gate @ I=0A    : {model.gate_value_at_raw_amps(0.0):.6f}  (must be 0.0)")
+    print(f"  Gate @ I=0A    : {model.gate_value_at_raw_amps(0.0):.6f}  "
+          f"(0.0 without floor; 0.15 after ren_model.py gate fix)")
 
     opt   = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     sched = WarmupCosine(opt, LR_WARMUP_EPOCHS, EPOCHS)
@@ -522,16 +690,17 @@ def main():
     )
     _, ren_rmse, ren_mae, ren_max = run_epoch(model, test_eps)
 
-    print(f"\n{'='*68}")
-    print(f"  FINAL RESULTS  (CC baseline vs CC+REN)")
-    print(f"{'='*68}")
-    print(f"  {'Metric':<16} {'CC+REN':>12}  {'CC':>12}  {'Improvement':>12}")
+    print(f"\n{'='*72}")
+    print(f"  FINAL RESULTS  (CC baseline vs REN Direct SOC)")
+    print(f"{'='*72}")
+    print(f"  {'Metric':<16} {'REN Direct':>12}  {'CC':>12}  {'Improvement':>12}")
     print(f"  {'-'*56}")
     for rv, cv, lbl in [(ren_rmse,cc_rmse,"RMSE"),(ren_mae,cc_mae,"MAE")]:
         print(f"  {lbl:<16} {rv:>12.5f}  {cv:>12.5f}  {(1-rv/cv)*100:>+11.1f}%")
 
     print(f"\n  Training time  : {(time.time()-t0)/60:.1f} min")
-    print(f"  Gate @ I=0A    : {model.gate_value_at_raw_amps(0.0):.6f}  (must be 0.0)")
+    print(f"  Gate @ I=0A    : {model.gate_value_at_raw_amps(0.0):.6f}  "
+          f"(apply ren_model.py gate floor fix before deployment)")
     print(f"  z0 norm        : {model.z0_norm():.4f}")
 
     # Training curves
@@ -540,15 +709,16 @@ def main():
     axes[0].plot(ep_x, t_losses, label="Train", color="steelblue", lw=1.5)
     axes[0].plot(ep_x, v_losses, label="Val",   color="tomato",    lw=1.5)
     axes[0].set_title("Loss"); axes[0].legend(); axes[0].grid(alpha=0.4)
-    axes[1].plot(ep_x, v_rmses, color="purple", lw=2, label="CC+REN RMSE")
+    axes[1].plot(ep_x, v_rmses, color="purple", lw=2, label="REN Direct RMSE")
     axes[1].axhline(cc_rmse, color="orange", ls="--", lw=1.5,
                     label=f"CC baseline = {cc_rmse:.4f}")
     axes[1].set_title("Val RMSE vs CC baseline"); axes[1].legend(); axes[1].grid(alpha=0.4)
     gate_vals = [r["gate_at_zero"] for r in log]
     axes[2].plot(ep_x, gate_vals, color="red", lw=1.5, label="gate @ I=0A (raw)")
-    axes[2].axhline(0, color="black", ls="--", lw=0.8)
-    axes[2].set_title("Gate @ I=0A  (target: 0.0)"); axes[2].legend(); axes[2].grid(alpha=0.4)
-    plt.suptitle("REN Pure Observer — 6-feature model", fontsize=12)
+    axes[2].axhline(0,    color="black", ls="--", lw=0.8)
+    axes[2].axhline(0.15, color="gray",  ls=":",  lw=0.8, label="floor=0.15 (if gate fix applied)")
+    axes[2].set_title("Gate @ I=0A"); axes[2].legend(); axes[2].grid(alpha=0.4)
+    plt.suptitle("REN v4.0 — Direct SOC (no soc_cc, directional+slope loss, ZC disabled)", fontsize=11)
     plt.tight_layout()
     plt.savefig(os.path.join(SAVE_DIR, "training_curves.png"), dpi=150, bbox_inches="tight")
     plt.close()

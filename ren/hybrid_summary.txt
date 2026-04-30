@@ -1,20 +1,20 @@
-CC + REN Hybrid vs CC  (Pure Observer, 6 features)
+REN vs CC  (Pure Observer, 6 features)
 ========================================================
-Features : ['v_ocv_approx', 'current', 'temperature_stack', 'temperature_tank', 'flow_rate', 'soc_cc']
+Features : ['v_ocv_approx', 'current', 'temperature_stack', 'temperature_tank', 'flow_rate', 'soc_init_decay']
 PI observer : REMOVED
-Gate @ I=0A : 0.000000  (must be 0.0)
-Corr(CC_err, correction): -0.0737  (target -1.0)
+Gate @ I=0A : 0.150000  (must be 0.0)
+Corr(CC_err, correction): -0.2712  (target -1.0)
 
-Metric                     CC+REN          CC   Improvement
+Metric                        REN          CC   Improvement
 ----------------------------------------------------------
-RMSE                      0.14602     0.14081         -3.7%
-MAE                       0.11922     0.11300         -5.5%
-Max Err                   0.33464     0.33562         +0.3%
-Bias                      0.03228     0.01349           ---
+RMSE                      0.07595     0.13184        +42.4%
+MAE                       0.05680     0.10285        +44.8%
+Max Err                   0.27869     0.34143        +18.4%
+Bias                      0.01619     0.02248           ---
 
-Episodes improved (RMSE): 19/40
-Steps improved: 41.4%
+Episodes improved (RMSE): 25/40
+Steps improved: 61.3%
 
-VERDICT : CC IS STILL BETTER
-RMSE improvement : -3.70%
-MAE  improvement : -5.50%
+VERDICT : REN IS BETTER
+RMSE improvement : +42.39%
+MAE  improvement : +44.77%
